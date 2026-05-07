@@ -10,14 +10,15 @@ requires-python = ">=3.11"
 dependencies = [
     "pyyaml",
     "pytest",
+    "structlog",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = [
+    "ada_platform",
     "agent",
     "core",
     "orchestrator",
-    "platform",
     "services",
     "ui",
 ]

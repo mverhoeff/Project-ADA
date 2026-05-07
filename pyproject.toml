@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "project-ada"
+version = "0.1.0"
+description = "Local voice-driven AI assistant pipeline."
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml",
+    "pytest",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "agent",
+    "core",
+    "orchestrator",
+    "platform",
+    "services",
+    "ui",
+]

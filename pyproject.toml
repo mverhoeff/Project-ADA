@@ -8,8 +8,10 @@ version = "0.1.0"
 description = "Local voice-driven AI assistant pipeline."
 requires-python = ">=3.11"
 dependencies = [
+    "httpx",
     "pyyaml",
     "pytest",
+    "pytest-asyncio",
     "structlog",
 ]
 

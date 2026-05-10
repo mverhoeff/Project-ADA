@@ -26,6 +26,14 @@ agent:
     - ~/Downloads
     - ~/Desktop
 
+audio:
+  mic_sample_rate: 16000
+  silence_threshold_ms: 1500
+  max_recording_ms: 30000
+  vad_aggressiveness: 2
+  input_device: null
+  output_device: null
+
 ui:
   hotkey: ctrl+alt+space
   wake_word_enabled: false

@@ -34,6 +34,10 @@ audio:
   input_device: null
   output_device: null
 
+orchestrator:
+  queue_size: 5
+  max_tool_iterations: 10
+
 ui:
   hotkey: ctrl+alt+space
   wake_word_enabled: false

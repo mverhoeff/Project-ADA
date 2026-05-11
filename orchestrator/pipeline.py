@@ -29,6 +29,7 @@ from core.exceptions import ServiceUnavailableError, ToolExecutionError
 from core.logger import get_logger
 from orchestrator.audio_input import capture_until_silence
 from orchestrator.audio_output import AudioPlayer
+from orchestrator.barge_in import BargeInListener
 from orchestrator.sentence_splitter import SentenceSplitter
 from orchestrator.session import Session
 from services.llm.client import LLMClient
@@ -55,13 +56,14 @@ class PipelineDeps:
     player: AudioPlayer
     tools: list[BaseTool]
     executor: ToolExecutor
+    barge_in: BargeInListener | None = None
 
 
 async def run_turn(
     session: Session,
     deps: PipelineDeps,
     config: dict[str, Any],
-) -> None:
+) -> bool:
     """Run one full conversational turn from microphone to speaker.
 
     Captures audio, transcribes, streams an LLM reply with concurrent
@@ -74,6 +76,13 @@ async def run_turn(
         deps: Service clients, tool list, and executor.
         config: Loaded config dict; the ``orchestrator`` subtree tunes
             queue size and the tool-iteration safety cap.
+
+    Returns:
+        ``True`` iff this turn was interrupted by a barge-in (the user
+        started speaking during playback). The caller should skip any
+        "wait for user trigger" step and start the next turn's capture
+        immediately. ``False`` on every other exit path (normal
+        completion, errors, empty transcript).
     """
     orch_cfg = config.get("orchestrator", {})
     max_tool_iters = int(
@@ -87,31 +96,34 @@ async def run_turn(
     except ServiceUnavailableError as e:
         _log.warning("turn_stt_unavailable", error=str(e))
         await _speak_user_message(deps, e.user_message)
-        return
+        return False
 
     transcript = stt_result.get("text", "").strip()
     if not transcript:
         _log.info("turn_empty_transcript")
-        return
+        return False
     session.add_message("user", transcript)
 
     for _ in range(max_tool_iters):
         messages = build_messages(session, deps.tools)
         try:
-            tool_call, assistant_text = await _stream_with_tts(
+            tool_call, assistant_text, barge_in_occurred = await _stream_with_tts(
                 deps, messages, config
             )
         except ServiceUnavailableError as e:
             _log.warning("turn_stream_unavailable", error=str(e))
             await _speak_user_message(deps, e.user_message)
             session.add_message("assistant", e.user_message)
-            return
+            return False
 
         if assistant_text:
             session.add_message("assistant", assistant_text)
 
+        if barge_in_occurred:
+            return True
+
         if tool_call is None:
-            return
+            return False
 
         try:
             result = await asyncio.to_thread(deps.executor.execute, tool_call)
@@ -121,18 +133,25 @@ async def run_turn(
         session.add_message("tool", result)
 
     _log.warning("turn_max_tool_iterations_exceeded", limit=max_tool_iters)
+    return False
 
 
 async def _stream_with_tts(
     deps: PipelineDeps,
     messages: list[dict[str, Any]],
     config: dict[str, Any],
-) -> tuple[dict[str, Any] | None, str]:
+) -> tuple[dict[str, Any] | None, str, bool]:
     """Run the Producer/Consumer pair for a single LLM stream.
 
-    Returns ``(tool_call_or_none, full_assistant_text)``. The assistant
-    text is the verbatim concatenation of every token the LLM emitted,
-    including any ``<tool_call>…</tool_call>`` block.
+    Returns ``(tool_call_or_none, full_assistant_text, barge_in_occurred)``.
+    The assistant text is the verbatim concatenation of every token the
+    LLM emitted before completion or interruption, including any
+    ``<tool_call>…</tool_call>`` block.
+
+    When ``deps.barge_in`` is set, a background listener races against
+    the streaming pair. If the listener fires before streaming
+    completes, the producer and consumer are cancelled, ``AudioPlayer``
+    aborts the active sink, and the tuple's third element is ``True``.
     """
     queue_size = int(
         config.get("orchestrator", {}).get("queue_size", _DEFAULT_QUEUE_SIZE)
@@ -197,19 +216,73 @@ async def _stream_with_tts(
 
     producer_task = asyncio.create_task(producer())
     consumer_task = asyncio.create_task(consumer())
+    barge_in_task: asyncio.Task[None] | None = None
+    if deps.barge_in is not None:
+        barge_in_task = asyncio.create_task(deps.barge_in.wait_for_speech())
+
+    barge_in_occurred = False
     try:
-        await asyncio.gather(producer_task, consumer_task)
+        barge_in_occurred = await _await_streaming(
+            producer_task, consumer_task, barge_in_task
+        )
+        if barge_in_occurred:
+            for t in (producer_task, consumer_task):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(
+                producer_task, consumer_task, return_exceptions=True
+            )
+        if barge_in_task is not None and not barge_in_task.done():
+            barge_in_task.cancel()
+            await asyncio.gather(barge_in_task, return_exceptions=True)
     except BaseException:
-        if not producer_task.done():
-            producer_task.cancel()
-        if not consumer_task.done():
-            consumer_task.cancel()
+        for t in (producer_task, consumer_task):
+            if not t.done():
+                t.cancel()
+        if barge_in_task is not None and not barge_in_task.done():
+            barge_in_task.cancel()
+        extras: list[asyncio.Task[None]] = (
+            [barge_in_task] if barge_in_task is not None else []
+        )
         await asyncio.gather(
-            producer_task, consumer_task, return_exceptions=True
+            producer_task, consumer_task, *extras, return_exceptions=True
         )
         raise
 
-    return detected_tool, "".join(accumulated)
+    return detected_tool, "".join(accumulated), barge_in_occurred
+
+
+async def _await_streaming(
+    producer_task: asyncio.Task[None],
+    consumer_task: asyncio.Task[None],
+    barge_in_task: asyncio.Task[None] | None,
+) -> bool:
+    """Await the producer + consumer, racing them against the listener.
+
+    Returns ``True`` iff the listener fired before streaming finished.
+    Re-raises any exception thrown by producer or consumer. Listener
+    failures are logged and otherwise ignored — they must never tear
+    down a turn that would otherwise complete normally.
+    """
+    while not (producer_task.done() and consumer_task.done()):
+        watch: set[asyncio.Future[Any]] = {producer_task, consumer_task}
+        if barge_in_task is not None and not barge_in_task.done():
+            watch.add(barge_in_task)
+        await asyncio.wait(watch, return_when=asyncio.FIRST_COMPLETED)
+
+        if barge_in_task is not None and barge_in_task.done():
+            if barge_in_task.cancelled():
+                pass
+            elif (exc := barge_in_task.exception()) is not None:
+                _log.warning("barge_in_listener_failed", error=str(exc))
+            else:
+                return True
+
+        for t in (producer_task, consumer_task):
+            if t.done() and not t.cancelled() and t.exception() is not None:
+                t.result()  # re-raises
+
+    return False
 
 
 async def _safe_put(queue: asyncio.Queue[str | None], sentence: str) -> None:

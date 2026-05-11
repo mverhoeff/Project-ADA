@@ -86,7 +86,14 @@ class FakeTTS:
 
 
 class FakePlayer:
-    """AudioPlayer stand-in. Drains the chunk iterator and records calls."""
+    """AudioPlayer stand-in. Drains the chunk iterator and records calls.
+
+    Yields to the event loop after each sentence so concurrent tasks
+    (notably the barge-in listener) get a turn between TTS calls. The
+    real ``AudioPlayer`` has many await points inside ``play``; this
+    fake compresses them into a single tail await without affecting
+    test assertions.
+    """
 
     def __init__(self) -> None:
         self.played: list[bytes] = []
@@ -94,6 +101,7 @@ class FakePlayer:
     async def play(self, chunk_iter: AsyncIterator[bytes]) -> None:
         async for chunk in chunk_iter:
             self.played.append(chunk)
+        await asyncio.sleep(0)
 
 
 class FakeExecutor:
@@ -117,6 +125,24 @@ class FakeExecutor:
         return result
 
 
+class FakeBargeInListener:
+    """BargeInListener stand-in.
+
+    ``wait_for_speech`` blocks on an ``asyncio.Event``; tests trigger it
+    by calling :meth:`trigger` (often from inside another fake to keep
+    the timing relative to streaming progress).
+    """
+
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+
+    def trigger(self) -> None:
+        self._event.set()
+
+    async def wait_for_speech(self) -> None:
+        await self._event.wait()
+
+
 def _config() -> dict[str, Any]:
     return {
         "audio": {"output_device": None},
@@ -131,6 +157,7 @@ def _build_deps(
     tts: FakeTTS,
     player: FakePlayer,
     executor: FakeExecutor,
+    barge_in: FakeBargeInListener | None = None,
 ) -> PipelineDeps:
     return PipelineDeps(
         stt=stt,            # type: ignore[arg-type]
@@ -139,6 +166,7 @@ def _build_deps(
         player=player,      # type: ignore[arg-type]
         tools=[],
         executor=executor,  # type: ignore[arg-type]
+        barge_in=barge_in,  # type: ignore[arg-type]
     )
 
 
@@ -458,3 +486,147 @@ async def test_consumer_drains_queue_before_tool_runs(fake_capture: None) -> Non
     ]
     # And the post-tool reply was spoken last.
     assert event_log[-1] == "tts:Done."
+
+
+# ---------------------------------------------------------------------------
+# Barge-in
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_turn_returns_false_on_normal_completion(
+    fake_capture: None,
+) -> None:
+    stt = FakeSTT(text="hi")
+    llm = FakeLLM(responses=[["Hello."]])
+    tts = FakeTTS()
+    player = FakePlayer()
+    executor = FakeExecutor(results=[])
+    deps = _build_deps(stt=stt, llm=llm, tts=tts, player=player, executor=executor)
+
+    result = await run_turn(Session(), deps, _config())
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_barge_in_cancels_remaining_playback_and_returns_true(
+    fake_capture: None,
+) -> None:
+    stt = FakeSTT(text="tell me a long story")
+    llm = FakeLLM(
+        responses=[
+            ["First. ", "Second. ", "Third. ", "Fourth. ", "Fifth."],
+        ]
+    )
+    player = FakePlayer()
+    executor = FakeExecutor(results=[])
+    barge_in = FakeBargeInListener()
+
+    class TriggeringTTS(FakeTTS):
+        """Fires the barge-in event when the second sentence is synthesized."""
+
+        def __init__(self, listener: FakeBargeInListener) -> None:
+            super().__init__()
+            self._listener = listener
+
+        async def synthesize(
+            self,
+            text: str,
+            voice: str | None = None,
+            speed: float | None = None,
+        ) -> AsyncIterator[bytes]:
+            self.spoken.append(text)
+            if len(self.spoken) == 2:
+                self._listener.trigger()
+                # Let the event loop service barge_in_task before this
+                # synthesize call finishes, so the listener wins the race
+                # against the next queue.get().
+                await asyncio.sleep(0)
+            yield b"audio:" + text.encode()
+
+    tts = TriggeringTTS(barge_in)
+    deps = _build_deps(
+        stt=stt, llm=llm, tts=tts, player=player, executor=executor, barge_in=barge_in
+    )
+    session = Session()
+
+    result = await run_turn(session, deps, _config())
+
+    assert result is True
+    # The trigger fires while the 2nd sentence is being synthesized — that
+    # sentence still completes (no cancellation point inside the fake
+    # synthesize/play), but the 3rd onwards must never reach TTS.
+    assert tts.spoken == ["First.", "Second."]
+    # History captures the user message plus whatever the producer
+    # accumulated before cancellation — at minimum the first two sentences.
+    assert session.history[0] == {"role": "user", "content": "tell me a long story"}
+    assert len(session.history) == 2
+    assistant_msg = session.history[1]
+    assert assistant_msg["role"] == "assistant"
+    assert assistant_msg["content"].startswith("First. Second.")
+
+
+@pytest.mark.asyncio
+async def test_barge_in_before_tool_call_skips_tool_execution(
+    fake_capture: None,
+) -> None:
+    stt = FakeSTT(text="search")
+    llm = FakeLLM(
+        responses=[
+            ["Working. ", _tool_call_token("shell", {})],
+            ["Should never run."],
+        ]
+    )
+    player = FakePlayer()
+    executor = FakeExecutor(results=["unused"])
+    barge_in = FakeBargeInListener()
+
+    class TriggeringTTS(FakeTTS):
+        def __init__(self, listener: FakeBargeInListener) -> None:
+            super().__init__()
+            self._listener = listener
+
+        async def synthesize(
+            self,
+            text: str,
+            voice: str | None = None,
+            speed: float | None = None,
+        ) -> AsyncIterator[bytes]:
+            self.spoken.append(text)
+            self._listener.trigger()
+            await asyncio.sleep(0)
+            yield b"audio:" + text.encode()
+
+    tts = TriggeringTTS(barge_in)
+    deps = _build_deps(
+        stt=stt, llm=llm, tts=tts, player=player, executor=executor, barge_in=barge_in
+    )
+    session = Session()
+
+    result = await run_turn(session, deps, _config())
+
+    assert result is True
+    # The acknowledgement spoke, but the tool was never invoked and the
+    # second LLM call was never made.
+    assert tts.spoken == ["Working."]
+    assert executor.calls == []
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_barge_in_listener_preserves_existing_behavior(
+    fake_capture: None,
+) -> None:
+    """Smoke test: with barge_in=None, run_turn returns False as before."""
+    stt = FakeSTT(text="hi")
+    llm = FakeLLM(responses=[["Hi! ", "How are you?"]])
+    tts = FakeTTS()
+    player = FakePlayer()
+    executor = FakeExecutor(results=[])
+    deps = _build_deps(
+        stt=stt, llm=llm, tts=tts, player=player, executor=executor, barge_in=None
+    )
+
+    result = await run_turn(Session(), deps, _config())
+    assert result is False
+    assert tts.spoken == ["Hi!", "How are you?"]

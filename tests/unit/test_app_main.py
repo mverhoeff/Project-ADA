@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -212,3 +213,77 @@ async def test_run_propagates_ollama_failure_without_starting_services(
         await main_mod.run(args, _BASE_CONFIG)
 
     assert created == []  # services were never even constructed
+
+
+# ---------------------------------------------------------------------------
+# _interactive_loop — barge-in skip-prompt behaviour
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_interactive_loop_skips_input_prompt_after_barge_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When run_turn returns True, the next iteration must NOT call input()."""
+    events: list[str] = []
+
+    def fake_input(_prompt: str) -> str:
+        events.append("input")
+        # Exit the loop after the third real input prompt.
+        if events.count("input") >= 3:
+            raise EOFError
+        return ""
+
+    run_turn_results = [False, True, False]
+
+    async def fake_run_turn(*_a: Any, **_kw: Any) -> bool:
+        events.append("run_turn")
+        return run_turn_results.pop(0)
+
+    monkeypatch.setattr(builtins, "input", fake_input)
+    monkeypatch.setattr(main_mod, "run_turn", fake_run_turn)
+
+    await main_mod._interactive_loop(MagicMock(), MagicMock(), {})
+
+    # The sequence must show that after run_turn returned True, the next
+    # event is another run_turn (input was skipped), and only then does
+    # the loop go back to awaiting input.
+    assert events == [
+        "input",
+        "run_turn",   # turn 1 → False
+        "input",
+        "run_turn",   # turn 2 → True (barge-in)
+        "run_turn",   # turn 3 — input prompt skipped
+        "input",      # turn 4's prompt → EOFError → exit
+    ]
+
+
+@pytest.mark.asyncio
+async def test_interactive_loop_prompts_each_turn_without_barge_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Baseline: when every turn returns False, each turn awaits input()."""
+    events: list[str] = []
+
+    def fake_input(_prompt: str) -> str:
+        events.append("input")
+        if events.count("input") >= 3:
+            raise EOFError
+        return ""
+
+    async def fake_run_turn(*_a: Any, **_kw: Any) -> bool:
+        events.append("run_turn")
+        return False
+
+    monkeypatch.setattr(builtins, "input", fake_input)
+    monkeypatch.setattr(main_mod, "run_turn", fake_run_turn)
+
+    await main_mod._interactive_loop(MagicMock(), MagicMock(), {})
+
+    assert events == [
+        "input",
+        "run_turn",
+        "input",
+        "run_turn",
+        "input",  # third prompt raises EOFError before run_turn
+    ]

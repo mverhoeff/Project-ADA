@@ -33,6 +33,9 @@ audio:
   vad_aggressiveness: 2
   input_device: null
   output_device: null
+  barge_in_enabled: false
+  barge_in_consecutive_speech_ms: 300
+  barge_in_vad_aggressiveness: 3
 
 orchestrator:
   queue_size: 5

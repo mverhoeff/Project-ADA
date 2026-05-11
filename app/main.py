@@ -104,14 +104,21 @@ async def _interactive_loop(
     deps: PipelineDeps,
     config: dict[str, Any],
 ) -> None:
-    """Drive ``run_turn`` once per Enter press until EOF or cancellation."""
+    """Drive ``run_turn`` once per Enter press until EOF or cancellation.
+
+    When the previous turn ended on a barge-in (the user started speaking
+    during playback), skip the Enter prompt and go straight into the
+    next capture — the user is already talking.
+    """
+    skip_prompt = False
     while True:
-        try:
-            await asyncio.to_thread(input, _INPUT_PROMPT)
-        except EOFError:
-            _log.info("stdin_closed")
-            return
-        await run_turn(session, deps, config)
+        if not skip_prompt:
+            try:
+                await asyncio.to_thread(input, _INPUT_PROMPT)
+            except EOFError:
+                _log.info("stdin_closed")
+                return
+        skip_prompt = await run_turn(session, deps, config)
 
 
 async def _check_ollama(config: dict[str, Any]) -> None:

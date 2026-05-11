@@ -15,6 +15,7 @@ from ada_platform.detect import current_platform
 from agent.executor import ToolExecutor
 from agent.tools import build_registry
 from orchestrator.audio_output import AudioPlayer
+from orchestrator.barge_in import BargeInListener
 from orchestrator.pipeline import PipelineDeps
 from orchestrator.session import Session
 from services.llm.client import LLMClient
@@ -47,4 +48,5 @@ def build_deps(config: dict[str, Any]) -> PipelineDeps:
         player=AudioPlayer(config),
         tools=list(registry.values()),
         executor=ToolExecutor(registry),
+        barge_in=BargeInListener(config),
     )

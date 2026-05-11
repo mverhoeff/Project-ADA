@@ -67,7 +67,7 @@ function Test-Nvidia {
     $cmd = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if (-not $cmd) {
         Write-Miss "nvidia-smi not in PATH" `
-                  "Install NVIDIA driver from https://www.nvidia.com/Download/index.aspx (CUDA Toolkit not required at runtime — the driver bundles libcuda)."
+                  "Install NVIDIA driver from https://www.nvidia.com/Download/index.aspx (CUDA Toolkit not required - the driver bundles libcuda)."
         return
     }
     $line = & nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>$null | Select-Object -First 1
@@ -106,7 +106,7 @@ function Test-OllamaDaemon {
         $script:HasOllamaDaemon = $true
     } catch {
         Write-Warn2 "ollama daemon not reachable at $OllamaUrl" `
-                   "Open Ollama from the Start menu — it runs as a tray app."
+                   "Open Ollama from the Start menu - it runs as a tray app."
     }
 }
 
@@ -162,7 +162,7 @@ function Invoke-PullModel {
     }
 }
 
-Write-Header "Project ADA — Windows installer"
+Write-Header "Project ADA - Windows installer"
 Write-Host "Repo: $RepoRoot"
 
 Write-Header "System checks"

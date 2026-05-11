@@ -21,7 +21,7 @@ dependencies = [
     "sounddevice",
     "structlog",
     "uvicorn",
-    "webrtcvad",
+    "webrtcvad-wheels",
 ]
 
 [project.scripts]

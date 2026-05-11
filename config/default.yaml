@@ -31,8 +31,8 @@ audio:
   silence_threshold_ms: 1500
   max_recording_ms: 30000
   vad_aggressiveness: 2
-  input_device: null
-  output_device: null
+  input_device: 1
+  output_device: 4
   barge_in_enabled: false
   barge_in_consecutive_speech_ms: 300
   barge_in_vad_aggressiveness: 3
@@ -50,5 +50,5 @@ vram:
   flush_threshold_percent: 95
 
 app:
-  service_startup_timeout_seconds: 120
+  service_startup_timeout_seconds: 600
   service_shutdown_timeout_seconds: 10

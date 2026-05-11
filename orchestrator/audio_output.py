@@ -119,13 +119,15 @@ class AudioPlayer:
         """Play every chunk from ``chunk_iter``.
 
         The first 44 bytes are buffered, parsed as a WAV header, and used
-        to open the sink; remaining bytes are written through. Handles
-        the case where the header is split across chunks.
+        to open the sink; remaining bytes are written through. A PCM
+        accumulation buffer ensures every sink.write() call receives a
+        whole number of samples (HTTP chunk boundaries may fall mid-sample).
 
         Raises:
             ServiceUnavailableError: If the WAV header is malformed.
         """
         header_buf = bytearray()
+        pcm_buf = bytearray()
         sink_cm: AbstractContextManager[_OutputSink] | None = None
         sink: _OutputSink | None = None
         try:
@@ -145,11 +147,14 @@ class AudioPlayer:
                         ) from e
                     sink_cm = self._sink_factory(wav_format)
                     sink = sink_cm.__enter__()
-                    leftover = bytes(header_buf[_HEADER_SIZE:])
-                    if leftover:
-                        sink.write(leftover)
+                    pcm_buf.extend(header_buf[_HEADER_SIZE:])
                 else:
-                    sink.write(chunk)
+                    pcm_buf.extend(chunk)
+                # Write only complete samples (2 bytes each for int16).
+                aligned = len(pcm_buf) & ~1
+                if aligned:
+                    sink.write(bytes(pcm_buf[:aligned]))
+                    del pcm_buf[:aligned]
         except asyncio.CancelledError:
             if sink is not None:
                 sink.abort()

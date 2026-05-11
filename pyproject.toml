@@ -24,10 +24,14 @@ dependencies = [
     "webrtcvad",
 ]
 
+[project.scripts]
+ada = "app.main:main"
+
 [tool.hatch.build.targets.wheel]
 packages = [
     "ada_platform",
     "agent",
+    "app",
     "core",
     "orchestrator",
     "services",

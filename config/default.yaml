@@ -45,3 +45,7 @@ ui:
 vram:
   warning_threshold_percent: 90
   flush_threshold_percent: 95
+
+app:
+  service_startup_timeout_seconds: 120
+  service_shutdown_timeout_seconds: 10

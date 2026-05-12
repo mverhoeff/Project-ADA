@@ -67,6 +67,30 @@ def format_results(results: list[dict[str, str]]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def format_fetch_result(title: str, url: str, text: str, max_chars: int) -> str:
+    """Render an extracted page as a title + body + source-line block.
+
+    Truncates ``text`` at the last whitespace boundary ≤ ``max_chars`` and
+    appends ``…[truncated]`` when clipping. Pure function — no I/O.
+    """
+    body = (text or "").strip()
+    if len(body) > max_chars:
+        cut = body.rfind(" ", 0, max_chars)
+        if cut <= 0:
+            cut = max_chars
+        body = body[:cut].rstrip() + "…[truncated]"
+
+    parts: list[str] = []
+    title_clean = (title or "").strip()
+    if title_clean:
+        parts.append(title_clean)
+        parts.append("")
+    parts.append(body)
+    parts.append("")
+    parts.append(f"[source: {url}]")
+    return "\n".join(parts)
+
+
 class _BrowserWorker:
     """Owns one Chromium instance on a dedicated daemon thread.
 
@@ -209,6 +233,54 @@ class _BrowserWorker:
             except Exception:
                 pass
 
+    def _op_fetch(self, context: Any, url: str, max_chars: int) -> str:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        page = context.new_page()
+        try:
+            try:
+                page.goto(url, timeout=self._nav_timeout_ms, wait_until="domcontentloaded")
+            except PlaywrightTimeoutError as exc:
+                raise ToolExecutionError(
+                    f"Navigation to {url!r} timed out after {self._nav_timeout_ms} ms.",
+                    "The page took too long to load.",
+                ) from exc
+
+            html = page.content()
+            title = (page.title() or "").strip()
+
+            text: str | None = None
+            try:
+                import trafilatura
+
+                text = trafilatura.extract(
+                    html,
+                    favor_recall=True,
+                    include_comments=False,
+                    include_tables=False,
+                )
+            except ImportError:
+                text = None
+
+            if not text:
+                try:
+                    text = page.locator("body").inner_text()
+                except Exception:
+                    text = None
+
+            if not text or not text.strip():
+                raise ToolExecutionError(
+                    f"Page returned no extractable text: {url}",
+                    "I couldn't read that page.",
+                )
+
+            return format_fetch_result(title, url, text, max_chars)
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
 
 class WebSearchTool(BaseTool):
     """Search the web and return the top results as plain text for the LLM."""
@@ -254,3 +326,57 @@ class WebSearchTool(BaseTool):
         max_results = max(1, min(requested, self._default_max))
 
         return self._worker.call("search", query=query.strip(), max_results=max_results)
+
+
+class WebFetchTool(BaseTool):
+    """Open a single URL and return the page's main readable text."""
+
+    name = "web_fetch"
+    description = (
+        "Open a single URL and return the page's main readable text. "
+        "Use this to read a page in detail after web_search returns its URL."
+    )
+    schema: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Absolute http(s) URL of the page to read.",
+            },
+            "max_chars": {
+                "type": "integer",
+                "description": "Truncate the extracted text at this many characters.",
+            },
+        },
+        "required": ["url"],
+    }
+
+    _MIN_MAX_CHARS: ClassVar[int] = 200
+
+    def __init__(self, worker: _BrowserWorker, config: dict[str, Any]) -> None:
+        agent_cfg = config.get("agent", {})
+        self._worker = worker
+        self._default_max: int = int(agent_cfg.get("web_fetch_max_chars", 4000))
+
+    def execute(self, params: dict[str, Any]) -> str:
+        url = params.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ToolExecutionError(
+                "web_fetch called without a non-empty 'url' argument.",
+                "I need a URL to read.",
+            )
+        url = url.strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise ToolExecutionError(
+                f"web_fetch refused non-http(s) URL: {url!r}",
+                "I can only read web pages.",
+            )
+
+        raw_max = params.get("max_chars", self._default_max)
+        try:
+            requested = int(raw_max)
+        except (TypeError, ValueError):
+            requested = self._default_max
+        max_chars = max(self._MIN_MAX_CHARS, min(requested, self._default_max))
+
+        return self._worker.call("fetch", url=url, max_chars=max_chars)

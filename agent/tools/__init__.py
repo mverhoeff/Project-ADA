@@ -6,7 +6,7 @@ from typing import Any
 
 from agent.tools.app_tool import OpenAppTool
 from agent.tools.base import BaseTool
-from agent.tools.browser_tool import WebSearchTool, _BrowserWorker
+from agent.tools.browser_tool import WebFetchTool, WebSearchTool, _BrowserWorker
 from agent.tools.system_tool import FileReadTool, ShellTool, SystemInfoTool
 
 
@@ -33,6 +33,7 @@ def build_registry(config: dict[str, Any]) -> dict[str, BaseTool]:
     if bool(config.get("agent", {}).get("browser_enabled", True)):
         worker = _BrowserWorker(config)
         tools.append(WebSearchTool(worker, config))
+        tools.append(WebFetchTool(worker, config))
     return {t.name: t for t in tools}
 
 
@@ -42,6 +43,7 @@ __all__ = [
     "OpenAppTool",
     "ShellTool",
     "SystemInfoTool",
+    "WebFetchTool",
     "WebSearchTool",
     "build_registry",
 ]

@@ -24,6 +24,7 @@ agent:
   browser_search_engine: duckduckgo
   browser_max_results: 5
   browser_navigation_timeout_ms: 15000
+  web_fetch_max_chars: 4000
   shell_timeout_seconds: 30
   allowed_paths:
     - ~/Documents

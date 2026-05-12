@@ -21,6 +21,7 @@ dependencies = [
     "scipy",
     "sounddevice",
     "structlog",
+    "trafilatura",
     "uvicorn",
     "webrtcvad-wheels",
 ]

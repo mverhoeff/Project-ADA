@@ -240,6 +240,7 @@ def test_build_registry_returns_all_tools() -> None:
         "read_file",
         "open_app",
         "web_search",
+        "web_fetch",
     }
     assert isinstance(registry["run_shell"], ShellTool)
     assert isinstance(registry["get_system_info"], SystemInfoTool)

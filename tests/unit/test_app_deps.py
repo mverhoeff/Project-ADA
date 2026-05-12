@@ -22,6 +22,10 @@ _BASE_CONFIG: dict[str, Any] = {
     "agent": {
         "shell_timeout_seconds": 30,
         "allowed_paths": ["~/Documents"],
+        "browser_enabled": True,
+        "browser_headless": True,
+        "browser_max_results": 5,
+        "browser_navigation_timeout_ms": 15000,
     },
 }
 
@@ -39,10 +43,11 @@ def test_build_deps_returns_wired_bundle() -> None:
     # tools list and executor's registry must reference the same instances.
     executor_tools = list(deps.executor._tools.values())  # type: ignore[attr-defined]
     assert deps.tools == executor_tools
-    # ShellTool, SystemInfoTool, FileReadTool, OpenAppTool — four built-ins today.
-    assert len(deps.tools) == 4
+    # ShellTool, SystemInfoTool, FileReadTool, OpenAppTool, WebSearchTool —
+    # five built-ins when browser is enabled (the default).
+    assert len(deps.tools) == 5
     names = {t.name for t in deps.tools}
-    assert names == {"run_shell", "get_system_info", "read_file", "open_app"}
+    assert names == {"run_shell", "get_system_info", "read_file", "open_app", "web_search"}
 
 
 def test_build_deps_is_pure_construction(monkeypatch: pytest.MonkeyPatch) -> None:

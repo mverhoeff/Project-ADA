@@ -234,7 +234,13 @@ def test_file_read_missing_agent_section_blocks_all() -> None:
 
 def test_build_registry_returns_all_tools() -> None:
     registry = build_registry(_FAKE_CONFIG)
-    assert set(registry.keys()) == {"run_shell", "get_system_info", "read_file", "open_app"}
+    assert set(registry.keys()) == {
+        "run_shell",
+        "get_system_info",
+        "read_file",
+        "open_app",
+        "web_search",
+    }
     assert isinstance(registry["run_shell"], ShellTool)
     assert isinstance(registry["get_system_info"], SystemInfoTool)
     assert isinstance(registry["read_file"], FileReadTool)

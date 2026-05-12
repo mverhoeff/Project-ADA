@@ -13,6 +13,7 @@ dependencies = [
     "httpx",
     "kokoro-onnx",
     "onnxruntime-gpu",
+    "playwright",
     "psutil",
     "pyyaml",
     "pytest",

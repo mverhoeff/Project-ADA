@@ -196,6 +196,17 @@ guided_pull_model() {
     fi
 }
 
+guided_install_chromium() {
+    if [ ! -x ".venv/bin/playwright" ]; then
+        return
+    fi
+    if prompt_yes "Install Chromium for the web_search tool (downloads ~120 MB)?"; then
+        printf "  ${C_DIM}(Playwright will show its own progress bar; this can take a minute.)${C_RST}\n"
+        .venv/bin/playwright install chromium
+        ok "Chromium installed"
+    fi
+}
+
 hdr "Project ADA — Linux installer (Fedora 43+)"
 printf "Repo: %s\n" "$REPO_ROOT"
 
@@ -217,6 +228,7 @@ fi
 guided_venv
 guided_pip_install
 guided_pull_model
+guided_install_chromium
 
 hdr "Next steps"
 cat <<EOF

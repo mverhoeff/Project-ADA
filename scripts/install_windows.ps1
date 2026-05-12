@@ -209,6 +209,17 @@ function Invoke-PullModel {
     }
 }
 
+function Invoke-InstallChromium {
+    $playwright = Join-Path $RepoRoot '.venv\Scripts\playwright.exe'
+    if (-not (Test-Path -LiteralPath $playwright)) { return }
+    if (Confirm-YesNo "Install Chromium for the web_search tool (downloads ~120 MB)?") {
+        Write-Host "  (Playwright will show its own progress bar; this can take a minute.)" -ForegroundColor DarkGray
+        & $playwright install chromium
+        if ($LASTEXITCODE -ne 0) { throw "playwright install chromium failed" }
+        Write-OK "Chromium installed"
+    }
+}
+
 Write-Header "Project ADA - Windows installer"
 Write-Host "Repo: $RepoRoot"
 
@@ -232,6 +243,7 @@ try {
     Invoke-Venv
     Invoke-PipInstall
     Invoke-PullModel
+    Invoke-InstallChromium
 } catch {
     Write-Host ""
     Write-Host "Guided step failed: $_" -ForegroundColor Red

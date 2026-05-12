@@ -31,6 +31,43 @@ miss() { printf "  ${C_MISS}[MISS]${C_RST} %s\n    ${C_DIM}%s${C_RST}\n" "$1" "$
 warn() { printf "  ${C_WARN}[WARN]${C_RST} %s\n    ${C_DIM}%s${C_RST}\n" "$1" "$2"; }
 hdr()  { printf "\n${C_DIM}== %s ==${C_RST}\n" "$1"; }
 
+# Run a command with an animated spinner and elapsed-time counter. Output is
+# buffered to a tempfile and only shown if the command fails. On non-tty
+# stdout (piped/CI), the spinner loop is skipped and we just print the final
+# [OK]/[FAIL] line.
+#
+# Usage: spinner_run "Label" cmd arg1 arg2 ...
+spinner_run() {
+    local label="$1"; shift
+    local logfile rc start elapsed
+    logfile=$(mktemp)
+    start=$SECONDS
+    if [ -t 1 ]; then
+        "$@" > "$logfile" 2>&1 &
+        local pid=$! frames='|/-\' i=0
+        while kill -0 "$pid" 2>/dev/null; do
+            printf "\r  ${C_DIM}%s${C_RST} %s (%ds)" \
+                   "${frames:$((i%4)):1}" "$label" "$((SECONDS-start))"
+            i=$((i+1))
+            sleep 0.1
+        done
+        if wait "$pid"; then rc=0; else rc=$?; fi
+    else
+        printf "  ... %s\n" "$label"
+        if "$@" > "$logfile" 2>&1; then rc=0; else rc=$?; fi
+    fi
+    elapsed=$((SECONDS-start))
+    if [ "$rc" -eq 0 ]; then
+        printf "\r  ${C_OK}[OK]${C_RST}   %s (%ds)%s\n" "$label" "$elapsed" "                              "
+    else
+        printf "\r  ${C_MISS}[FAIL]${C_RST} %s (%ds)%s\n" "$label" "$elapsed" "                              "
+        printf "  ${C_DIM}--- output ---${C_RST}\n"
+        sed 's/^/    /' "$logfile"
+    fi
+    rm -f "$logfile"
+    return "$rc"
+}
+
 # Track missing critical deps so the summary can show whether the user
 # can already proceed with the guided steps.
 MISSING_HARD=0
@@ -132,8 +169,7 @@ guided_venv() {
         return
     fi
     if prompt_yes "Create .venv (python3 -m venv .venv)?"; then
-        python3 -m venv .venv
-        ok ".venv created"
+        spinner_run "Creating .venv" python3 -m venv .venv
     fi
 }
 
@@ -144,9 +180,8 @@ guided_pip_install() {
         return
     fi
     if prompt_yes "Install project into .venv (pip install -e .)?"; then
-        .venv/bin/pip install --upgrade pip
-        .venv/bin/pip install -e .
-        ok "project installed into .venv"
+        spinner_run "Upgrading pip" .venv/bin/pip install --upgrade pip
+        spinner_run "Installing project (pip install -e .)" .venv/bin/pip install -e .
     fi
 }
 
@@ -155,6 +190,7 @@ guided_pull_model() {
         return
     fi
     if prompt_yes "Pull ${LLM_MODEL} into Ollama now (may download several GB)?"; then
+        printf "  ${C_DIM}(Ollama will show its own progress bar; this can take 5-10 minutes.)${C_RST}\n"
         ollama pull "${LLM_MODEL}"
         ok "${LLM_MODEL} pulled"
     fi

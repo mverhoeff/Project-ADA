@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent.tools.app_tool import OpenAppTool
 from agent.tools.base import BaseTool
 from agent.tools.system_tool import FileReadTool, ShellTool, SystemInfoTool
 
@@ -21,6 +22,7 @@ def build_registry(config: dict[str, Any]) -> dict[str, BaseTool]:
         ShellTool(config),
         SystemInfoTool(),
         FileReadTool(config),
+        OpenAppTool(),
     ]
     return {t.name: t for t in tools}
 
@@ -28,6 +30,7 @@ def build_registry(config: dict[str, Any]) -> dict[str, BaseTool]:
 __all__ = [
     "BaseTool",
     "FileReadTool",
+    "OpenAppTool",
     "ShellTool",
     "SystemInfoTool",
     "build_registry",

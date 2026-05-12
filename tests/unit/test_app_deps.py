@@ -39,10 +39,10 @@ def test_build_deps_returns_wired_bundle() -> None:
     # tools list and executor's registry must reference the same instances.
     executor_tools = list(deps.executor._tools.values())  # type: ignore[attr-defined]
     assert deps.tools == executor_tools
-    # ShellTool, SystemInfoTool, FileReadTool — exactly three built-ins today.
-    assert len(deps.tools) == 3
+    # ShellTool, SystemInfoTool, FileReadTool, OpenAppTool — four built-ins today.
+    assert len(deps.tools) == 4
     names = {t.name for t in deps.tools}
-    assert names == {"run_shell", "get_system_info", "read_file"}
+    assert names == {"run_shell", "get_system_info", "read_file", "open_app"}
 
 
 def test_build_deps_is_pure_construction(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -39,6 +39,54 @@ function Write-Header ([string]$title) {
     Write-Host "== $title ==" -ForegroundColor DarkGray
 }
 
+# Run a process with an animated spinner and elapsed-time counter. Output is
+# buffered to temp files and only shown if the process fails. Throws on
+# non-zero exit so the caller's try/catch handles cleanup as before.
+function Invoke-WithSpinner {
+    param(
+        [Parameter(Mandatory=$true)][string]$Label,
+        [Parameter(Mandatory=$true)][string]$FilePath,
+        [Parameter(Mandatory=$true)][string[]]$ArgumentList
+    )
+
+    $outLog = [System.IO.Path]::GetTempFileName()
+    $errLog = [System.IO.Path]::GetTempFileName()
+
+    $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList `
+        -NoNewWindow -PassThru `
+        -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+
+    $start = Get-Date
+    $frames = '|','/','-','\'
+    $i = 0
+    while (-not $proc.HasExited) {
+        $el = [int]((Get-Date) - $start).TotalSeconds
+        [Console]::Write("`r  $($frames[$i % 4]) $Label (${el}s)   ")
+        Start-Sleep -Milliseconds 100
+        $i++
+    }
+
+    $el = [int]((Get-Date) - $start).TotalSeconds
+    $pad = ' ' * 30
+    if ($proc.ExitCode -eq 0) {
+        Write-Host ("`r  [OK]   $Label (${el}s)$pad") -ForegroundColor Green
+    } else {
+        Write-Host ("`r  [FAIL] $Label (${el}s)$pad") -ForegroundColor Red
+        Write-Host "  --- output ---" -ForegroundColor DarkGray
+        foreach ($log in @($outLog, $errLog)) {
+            if ((Test-Path $log) -and ((Get-Item $log).Length -gt 0)) {
+                Get-Content $log | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+            }
+        }
+    }
+
+    Remove-Item $outLog, $errLog -ErrorAction SilentlyContinue
+
+    if ($proc.ExitCode -ne 0) {
+        throw "$Label failed (exit $($proc.ExitCode))"
+    }
+}
+
 function Test-Python {
     $py = Get-Command python -ErrorAction SilentlyContinue
     if (-not $py) {
@@ -132,9 +180,8 @@ function Invoke-Venv {
         return
     }
     if (Confirm-YesNo "Create .venv (python -m venv .venv)?") {
-        & python -m venv .venv
-        if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
-        Write-OK ".venv created"
+        Invoke-WithSpinner -Label "Creating .venv" -FilePath "python" `
+            -ArgumentList @("-m", "venv", ".venv")
     }
 }
 
@@ -145,17 +192,17 @@ function Invoke-PipInstall {
         return
     }
     if (Confirm-YesNo "Install project into .venv (pip install -e .)?") {
-        & $pip install --upgrade pip
-        if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
-        & $pip install -e .
-        if ($LASTEXITCODE -ne 0) { throw "pip install -e . failed" }
-        Write-OK "project installed into .venv"
+        Invoke-WithSpinner -Label "Upgrading pip" -FilePath $pip `
+            -ArgumentList @("install", "--upgrade", "pip")
+        Invoke-WithSpinner -Label "Installing project (pip install -e .)" -FilePath $pip `
+            -ArgumentList @("install", "-e", ".")
     }
 }
 
 function Invoke-PullModel {
     if (-not $script:HasOllamaDaemon -or $script:HasModel) { return }
     if (Confirm-YesNo "Pull $LlmModel into Ollama now (may download several GB)?") {
+        Write-Host "  (Ollama will show its own progress bar; this can take 5-10 minutes.)" -ForegroundColor DarkGray
         & ollama pull $LlmModel
         if ($LASTEXITCODE -ne 0) { throw "ollama pull failed" }
         Write-OK "$LlmModel pulled"

@@ -14,7 +14,7 @@ llm:
 tts:
   model: kokoro-v1.0
   voice: af_sky
-  speed: 1.0
+  speed: 1.25
   port: 8772
   stream: true
 
@@ -51,7 +51,7 @@ ui:
   wake_word_enabled: false
 
 vram:
-  warning_threshold_percent: 90
+  warning_threshold_percent: 95
   flush_threshold_percent: 95
 
 app:

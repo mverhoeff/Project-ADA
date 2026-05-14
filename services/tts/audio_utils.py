@@ -28,9 +28,10 @@ _BOLD_DOUBLE_UNDERSCORE = re.compile(r"__(.+?)__", flags=re.DOTALL)
 _ITALIC_SINGLE_STAR = re.compile(r"\*(.+?)\*", flags=re.DOTALL)
 _ITALIC_SINGLE_UNDERSCORE = re.compile(r"(?<!\w)_(.+?)_(?!\w)", flags=re.DOTALL)
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+", flags=re.MULTILINE)
-_BULLET = re.compile(r"^\s*(?:[-*•]|\d+\.)\s+", flags=re.MULTILINE)
+_BULLET = re.compile(r"(?:^|\n)[ \t]*(?:[-*•]|\d+\.)[ \t]+")
 _MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 _WHITESPACE = re.compile(r"\s+")
+_LEADING_PUNCT = re.compile(r"^[,\s]+")
 
 
 def preprocess_text(text: str) -> str:
@@ -49,10 +50,11 @@ def preprocess_text(text: str) -> str:
     text = _ITALIC_SINGLE_STAR.sub(r"\1", text)
     text = _ITALIC_SINGLE_UNDERSCORE.sub(r"\1", text)
     text = _HEADING.sub("", text)
-    text = _BULLET.sub("", text)
+    text = _BULLET.sub(", ", text)
     text = _MARKDOWN_LINK.sub(r"\1", text)
     text = text.replace("&", " and ").replace("<", " ").replace(">", " ")
     text = _WHITESPACE.sub(" ", text).strip()
+    text = _LEADING_PUNCT.sub("", text)
     return text
 
 

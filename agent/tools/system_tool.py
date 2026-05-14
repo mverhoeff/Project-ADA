@@ -32,6 +32,80 @@ _DENY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"rmdir\s+/s", re.IGNORECASE),
 )
 
+_NVIDIA_SMI_TIMEOUT = 5
+_CPU_TEMP_KEYS: tuple[str, ...] = ("coretemp", "k10temp", "cpu_thermal", "acpitz")
+
+
+def _query_gpu_stats() -> dict[str, float] | None:
+    """Return VRAM and temperature for the first GPU, or ``None`` on failure.
+
+    Uses ``nvidia-smi``; mirrors the error-handling pattern in
+    :mod:`orchestrator.vram_monitor` so missing drivers or parse errors
+    degrade silently instead of breaking the tool call.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_NVIDIA_SMI_TIMEOUT,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    lines = result.stdout.strip().splitlines()
+    if not lines:
+        return None
+
+    try:
+        used_str, total_str, temp_str = lines[0].split(",")
+        used = float(used_str.strip())
+        total = float(total_str.strip())
+        temp = float(temp_str.strip())
+    except (ValueError, IndexError):
+        return None
+
+    if total <= 0:
+        return None
+
+    return {
+        "vram_used_mb": used,
+        "vram_total_mb": total,
+        "vram_percent": (used / total) * 100.0,
+        "temp_celsius": temp,
+    }
+
+
+def _query_cpu_temp() -> float | None:
+    """Return CPU temperature in Celsius via ``psutil``, or ``None``.
+
+    On Windows ``psutil.sensors_temperatures`` is not implemented and this
+    returns ``None``; reading CPU temperature there requires a third-party
+    helper service (e.g. LibreHardwareMonitor) which is intentionally not
+    a dependency of this project.
+    """
+    sensors = getattr(psutil, "sensors_temperatures", None)
+    if sensors is None:
+        return None
+    try:
+        readings = sensors()
+    except (AttributeError, OSError, NotImplementedError):
+        return None
+    if not readings:
+        return None
+    for key in _CPU_TEMP_KEYS:
+        entries = readings.get(key)
+        if entries:
+            return float(entries[0].current)
+    return None
+
 
 class ShellTool(BaseTool):
     """Run a shell command and return combined stdout/stderr.
@@ -94,10 +168,19 @@ class ShellTool(BaseTool):
 
 
 class SystemInfoTool(BaseTool):
-    """Return current CPU, memory, and disk usage as a JSON string."""
+    """Return current system usage stats as a JSON string.
+
+    The schema is stable: fields that cannot be read on this platform
+    (CPU temperature on Windows; GPU fields without ``nvidia-smi``) are
+    reported as ``null`` rather than omitted.
+    """
 
     name = "get_system_info"
-    description = "Return current CPU, memory, and disk usage percentages."
+    description = (
+        "Return current system usage: CPU percent and temperature, memory and "
+        "disk percent, and GPU temperature and VRAM usage. Fields that cannot "
+        "be read on this platform are returned as null."
+    )
     schema: ClassVar[dict[str, Any]] = {
         "type": "object",
         "properties": {},
@@ -105,10 +188,16 @@ class SystemInfoTool(BaseTool):
     }
 
     def execute(self, params: dict[str, Any]) -> str:
-        info = {
+        gpu = _query_gpu_stats()
+        info: dict[str, Any] = {
             "cpu_percent": psutil.cpu_percent(interval=None),
+            "cpu_temp_celsius": _query_cpu_temp(),
             "memory_percent": psutil.virtual_memory().percent,
             "disk_percent": psutil.disk_usage("/").percent,
+            "gpu_temp_celsius": gpu["temp_celsius"] if gpu else None,
+            "vram_percent": gpu["vram_percent"] if gpu else None,
+            "vram_used_mb": gpu["vram_used_mb"] if gpu else None,
+            "vram_total_mb": gpu["vram_total_mb"] if gpu else None,
         }
         return json.dumps(info)
 

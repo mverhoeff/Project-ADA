@@ -1,20 +1,23 @@
-"""Agent tool that searches the web via a headless Chromium browser.
+"""Agent tools for web search and single-page fetching.
 
-A single Chromium instance is launched lazily on a dedicated daemon thread
-(:class:`_BrowserWorker`) and reused across calls — Playwright's sync API
-objects are pinned to their creating thread, and the orchestrator dispatches
-tool calls through :func:`asyncio.to_thread`, which uses a non-deterministic
-worker pool. The dedicated thread is the simplest way to keep one browser
-instance live across calls without restructuring the executor.
+:class:`WebSearchTool` queries DuckDuckGo through the maintained ``ddgs``
+library, which handles DDG's evolving anti-bot countermeasures internally
+— scraping ``html.duckduckgo.com`` with a headless Chromium no longer
+works (DDG returns its JS homepage instead of results).
 
-The public surface is :class:`WebSearchTool`; the worker class is module-private.
+:class:`WebFetchTool` still drives a headless Chromium for arbitrary
+URLs, since loading a single user-chosen page is not gated by the same
+anti-bot protection. A single Chromium instance is launched lazily on a
+dedicated daemon thread (:class:`_BrowserWorker`) and reused across
+calls — Playwright's sync API objects are pinned to their creating
+thread, and the orchestrator dispatches tool calls through
+:func:`asyncio.to_thread`, which uses a non-deterministic worker pool.
 """
 
 from __future__ import annotations
 
 import queue
 import threading
-import urllib.parse
 from typing import Any, ClassVar
 
 from agent.tools.base import BaseTool
@@ -24,33 +27,13 @@ from core.logger import get_logger
 _log = get_logger(__name__)
 
 
-_DDG_HTML_URL = "https://html.duckduckgo.com/html/"
-_DDG_RESULT_SELECTOR = "div.result"
-_DDG_TITLE_SELECTOR = "a.result__a"
-_DDG_SNIPPET_SELECTOR = "a.result__snippet, .result__snippet"
-
 _WORKER_START_TIMEOUT_S = 30.0
-
-
-def _unwrap_ddg_redirect(href: str) -> str:
-    """DDG wraps result hrefs in ``/l/?uddg=<encoded-url>&…``. Unwrap if present."""
-    if not href:
-        return href
-    parsed = urllib.parse.urlparse(href)
-    if parsed.path.startswith("/l/") or parsed.netloc.endswith("duckduckgo.com"):
-        qs = urllib.parse.parse_qs(parsed.query)
-        uddg = qs.get("uddg", [None])[0]
-        if uddg:
-            return uddg
-    if href.startswith("//"):
-        return "https:" + href
-    return href
 
 
 def format_results(results: list[dict[str, str]]) -> str:
     """Render a list of ``{title, snippet, url}`` dicts as plain text.
 
-    Pure function — extracted so it can be unit-tested without Playwright.
+    Pure function — extracted so it can be unit-tested without network I/O.
     """
     if not results:
         return "No results found."
@@ -193,46 +176,6 @@ class _BrowserWorker:
             except Exception:
                 pass
 
-    def _op_search(self, context: Any, query: str, max_results: int) -> str:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
-        page = context.new_page()
-        try:
-            url = _DDG_HTML_URL + "?" + urllib.parse.urlencode({"q": query})
-            try:
-                page.goto(url, timeout=self._nav_timeout_ms, wait_until="domcontentloaded")
-            except PlaywrightTimeoutError as exc:
-                raise ToolExecutionError(
-                    f"Navigation to {url!r} timed out after {self._nav_timeout_ms} ms.",
-                    "The search timed out. The network may be slow or unreachable.",
-                ) from exc
-
-            elements = page.query_selector_all(_DDG_RESULT_SELECTOR)
-            results: list[dict[str, str]] = []
-            for el in elements:
-                if len(results) >= max_results:
-                    break
-                title_el = el.query_selector(_DDG_TITLE_SELECTOR)
-                if title_el is None:
-                    continue
-                title = (title_el.inner_text() or "").strip()
-                href = (title_el.get_attribute("href") or "").strip()
-                snippet_el = el.query_selector(_DDG_SNIPPET_SELECTOR)
-                snippet = (snippet_el.inner_text().strip() if snippet_el is not None else "")
-                results.append(
-                    {
-                        "title": title,
-                        "snippet": snippet,
-                        "url": _unwrap_ddg_redirect(href),
-                    }
-                )
-            return format_results(results)
-        finally:
-            try:
-                page.close()
-            except Exception:
-                pass
-
     def _op_fetch(self, context: Any, url: str, max_chars: int) -> str:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -283,7 +226,7 @@ class _BrowserWorker:
 
 
 class WebSearchTool(BaseTool):
-    """Search the web and return the top results as plain text for the LLM."""
+    """Search the web via the ``ddgs`` library and return top results as text."""
 
     name = "web_search"
     description = (
@@ -306,9 +249,8 @@ class WebSearchTool(BaseTool):
         "required": ["query"],
     }
 
-    def __init__(self, worker: _BrowserWorker, config: dict[str, Any]) -> None:
+    def __init__(self, config: dict[str, Any]) -> None:
         agent_cfg = config.get("agent", {})
-        self._worker = worker
         self._default_max: int = int(agent_cfg.get("browser_max_results", 5))
 
     def execute(self, params: dict[str, Any]) -> str:
@@ -325,7 +267,32 @@ class WebSearchTool(BaseTool):
             requested = self._default_max
         max_results = max(1, min(requested, self._default_max))
 
-        return self._worker.call("search", query=query.strip(), max_results=max_results)
+        try:
+            from ddgs import DDGS
+        except ImportError as exc:
+            raise ToolExecutionError(
+                f"ddgs not installed: {exc}",
+                "The web search library is not installed.",
+            ) from exc
+
+        try:
+            raw = list(DDGS().text(query.strip(), max_results=max_results))
+        except Exception as exc:
+            _log.error("web_search_failed", error=str(exc))
+            raise ToolExecutionError(
+                f"ddgs search failed: {exc}",
+                "The search failed. The network may be unreachable.",
+            ) from exc
+
+        results = [
+            {
+                "title": r.get("title", ""),
+                "snippet": r.get("body", ""),
+                "url": r.get("href", ""),
+            }
+            for r in raw
+        ]
+        return format_results(results)
 
 
 class WebFetchTool(BaseTool):

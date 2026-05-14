@@ -65,10 +65,16 @@ function Invoke-WithSpinner {
         Start-Sleep -Milliseconds 100
         $i++
     }
+    $proc.WaitForExit()
+
+    # Start-Process -PassThru with redirected output on Windows PowerShell 5.1
+    # sometimes returns $null for ExitCode even when the process succeeded
+    # (e.g. python.exe after pip self-upgrade). Treat $null as success.
+    $exitCode = if ($null -eq $proc.ExitCode) { 0 } else { $proc.ExitCode }
 
     $el = [int]((Get-Date) - $start).TotalSeconds
     $pad = ' ' * 30
-    if ($proc.ExitCode -eq 0) {
+    if ($exitCode -eq 0) {
         Write-Host ("`r  [OK]   $Label (${el}s)$pad") -ForegroundColor Green
     } else {
         Write-Host ("`r  [FAIL] $Label (${el}s)$pad") -ForegroundColor Red
@@ -82,8 +88,8 @@ function Invoke-WithSpinner {
 
     Remove-Item $outLog, $errLog -ErrorAction SilentlyContinue
 
-    if ($proc.ExitCode -ne 0) {
-        throw "$Label failed (exit $($proc.ExitCode))"
+    if ($exitCode -ne 0) {
+        throw "$Label failed (exit $exitCode)"
     }
 }
 
@@ -186,16 +192,16 @@ function Invoke-Venv {
 }
 
 function Invoke-PipInstall {
-    $pip = Join-Path $RepoRoot '.venv\Scripts\pip.exe'
-    if (-not (Test-Path -LiteralPath $pip)) {
-        Write-Warn2 "no .venv\Scripts\pip.exe; skipping 'pip install -e .'" "Create the venv first."
+    $venvPython = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $venvPython)) {
+        Write-Warn2 "no .venv\Scripts\python.exe; skipping 'pip install -e .'" "Create the venv first."
         return
     }
     if (Confirm-YesNo "Install project into .venv (pip install -e .)?") {
-        Invoke-WithSpinner -Label "Upgrading pip" -FilePath $pip `
-            -ArgumentList @("install", "--upgrade", "pip")
-        Invoke-WithSpinner -Label "Installing project (pip install -e .)" -FilePath $pip `
-            -ArgumentList @("install", "-e", ".")
+        Invoke-WithSpinner -Label "Upgrading pip" -FilePath $venvPython `
+            -ArgumentList @("-m", "pip", "install", "--upgrade", "pip")
+        Invoke-WithSpinner -Label "Installing project (pip install -e .)" -FilePath $venvPython `
+            -ArgumentList @("-m", "pip", "install", "-e", ".")
     }
 }
 
@@ -254,7 +260,7 @@ try {
 
 Write-Header "Next steps"
 @'
-  1. .\.venv\Scripts\Activate.ps1
+  1. powershell -ExecutionPolicy Bypass -NoExit -File .venv\Scripts\Activate.ps1
   2. ada --once        # single conversational turn
      ada               # interactive loop ('Press Enter to speak')
 

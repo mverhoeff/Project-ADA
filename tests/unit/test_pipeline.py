@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
+from agent.tools.base import BaseTool
 from core.exceptions import ServiceUnavailableError, ToolExecutionError
 from orchestrator import pipeline
 from orchestrator.pipeline import PipelineDeps, run_turn
 from orchestrator.session import Session
+from services.llm.events import StreamEvent, TextChunk, ToolCallChunk
 
 
 # ---------------------------------------------------------------------------
@@ -43,29 +44,38 @@ class FakeSTT:
 class FakeLLM:
     """LLMClient stand-in.
 
-    ``responses`` is a list of one response per ``stream_chat`` call.
-    Each response is either a list of token strings (yielded one by one)
-    or an Exception to raise.
+    ``responses`` is a list of one response per ``stream_chat`` call. Each
+    response is either a list of items or an Exception to raise. Items may
+    be raw ``str`` (auto-wrapped as :class:`TextChunk` for convenience) or
+    pre-built :class:`StreamEvent` instances.
     """
 
-    def __init__(self, responses: list[list[str] | BaseException]) -> None:
+    def __init__(
+        self,
+        responses: list[list[str | StreamEvent] | BaseException],
+    ) -> None:
         self._responses = list(responses)
         self.calls: list[list[dict[str, Any]]] = []
+        self.tools_calls: list[list[dict[str, Any]] | None] = []
 
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamEvent]:
         # Snapshot messages so later mutations to session.history don't leak.
         self.calls.append(copy.deepcopy(messages))
+        self.tools_calls.append(copy.deepcopy(tools))
         if not self._responses:
             raise AssertionError("FakeLLM ran out of scripted responses")
         response = self._responses.pop(0)
         if isinstance(response, BaseException):
             raise response
-        for token in response:
-            yield token
+        for item in response:
+            if isinstance(item, (TextChunk, ToolCallChunk)):
+                yield item
+            else:
+                yield TextChunk(text=item)
 
 
 class FakeTTS:
@@ -157,6 +167,7 @@ def _build_deps(
     tts: FakeTTS,
     player: FakePlayer,
     executor: FakeExecutor,
+    tools: list[BaseTool] | None = None,
     barge_in: FakeBargeInListener | None = None,
 ) -> PipelineDeps:
     return PipelineDeps(
@@ -164,7 +175,7 @@ def _build_deps(
         llm=llm,            # type: ignore[arg-type]
         tts=tts,            # type: ignore[arg-type]
         player=player,      # type: ignore[arg-type]
-        tools=[],
+        tools=tools or [],
         executor=executor,  # type: ignore[arg-type]
         barge_in=barge_in,  # type: ignore[arg-type]
     )
@@ -180,9 +191,11 @@ def fake_capture(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pipeline, "capture_until_silence", _capture)
 
 
-def _tool_call_token(name: str = "shell", arguments: dict[str, Any] | None = None) -> str:
-    payload = {"name": name, "arguments": arguments or {}}
-    return f"<tool_call>{json.dumps(payload)}</tool_call>"
+def _tool_call_event(
+    name: str = "shell",
+    arguments: dict[str, Any] | None = None,
+) -> ToolCallChunk:
+    return ToolCallChunk(name=name, arguments=arguments or {})
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +250,7 @@ async def test_tool_call_path_executes_tool_and_resumes_stream(
     stt = FakeSTT(text="search for cats")
     llm = FakeLLM(
         responses=[
-            ["Searching now. ", _tool_call_token("shell", {"cmd": "echo"})],
+            ["Searching now. ", _tool_call_event("shell", {"cmd": "echo"})],
             ["Done."],
         ]
     )
@@ -254,23 +267,67 @@ async def test_tool_call_path_executes_tool_and_resumes_stream(
     assert executor.calls == [{"name": "shell", "arguments": {"cmd": "echo"}}]
 
     # History captures both LLM legs and the tool result in between.
+    # The assistant message records the structured tool_calls so the second
+    # LLM call sees a coherent exchange and doesn't retry the same tool.
     assert session.history == [
         {"role": "user", "content": "search for cats"},
         {
             "role": "assistant",
-            "content": "Searching now. " + _tool_call_token("shell", {"cmd": "echo"}),
+            "content": "Searching now. ",
+            "tool_calls": [
+                {"function": {"name": "shell", "arguments": {"cmd": "echo"}}}
+            ],
         },
-        {"role": "tool", "content": "search-result"},
+        {"role": "tool", "content": "search-result", "name": "shell"},
         {"role": "assistant", "content": "Done."},
     ]
 
 
 @pytest.mark.asyncio
-async def test_tool_call_xml_never_reaches_tts(fake_capture: None) -> None:
+async def test_second_llm_call_sees_structured_tool_exchange(
+    fake_capture: None,
+) -> None:
+    """Regression: without the tool_calls field on the assistant message,
+    the LLM cannot tell that the tool message answers its own request and
+    loops on the same call until max_tool_iterations trips."""
+    stt = FakeSTT(text="search please")
+    llm = FakeLLM(
+        responses=[
+            ["Searching. ", _tool_call_event("web_search", {"query": "cats"})],
+            ["Found some cats."],
+        ]
+    )
+    tts = FakeTTS()
+    player = FakePlayer()
+    executor = FakeExecutor(results=["1. cat result"])
+    deps = _build_deps(stt=stt, llm=llm, tts=tts, player=player, executor=executor)
+    session = Session()
+
+    await run_turn(session, deps, _config())
+
+    second_messages = llm.calls[1]
+    # The assistant message right before the tool message must carry the
+    # tool_calls field, otherwise Ollama's chat template can't pair them.
+    assert second_messages[-2] == {
+        "role": "assistant",
+        "content": "Searching. ",
+        "tool_calls": [
+            {"function": {"name": "web_search", "arguments": {"query": "cats"}}}
+        ],
+    }
+    assert second_messages[-1] == {
+        "role": "tool",
+        "content": "1. cat result",
+        "name": "web_search",
+    }
+
+
+@pytest.mark.asyncio
+async def test_bare_tool_call_event_produces_no_tts(fake_capture: None) -> None:
     stt = FakeSTT(text="run it")
     llm = FakeLLM(
         responses=[
-            [_tool_call_token("shell", {})],
+            [_tool_call_event("shell", {})],
             ["All done."],
         ]
     )
@@ -282,35 +339,8 @@ async def test_tool_call_xml_never_reaches_tts(fake_capture: None) -> None:
 
     await run_turn(session, deps, _config())
 
-    # The first LLM leg produced no spoken sentences (only a bare tool_call).
+    # The first LLM leg produced no spoken sentences (only a bare tool call).
     assert tts.spoken == ["All done."]
-    assert executor.calls == [{"name": "shell", "arguments": {}}]
-
-
-@pytest.mark.asyncio
-async def test_partial_tool_open_split_across_tokens_is_not_spoken(
-    fake_capture: None,
-) -> None:
-    stt = FakeSTT(text="run it")
-    # The opening tag is split across two tokens — the splitter must
-    # never receive a partial "<tool" prefix.
-    llm = FakeLLM(
-        responses=[
-            ["<to", "ol_call>", json.dumps({"name": "shell", "arguments": {}}), "</tool_call>"],
-            ["Result is in."],
-        ]
-    )
-    tts = FakeTTS()
-    player = FakePlayer()
-    executor = FakeExecutor(results=["ok"])
-    deps = _build_deps(stt=stt, llm=llm, tts=tts, player=player, executor=executor)
-    session = Session()
-
-    await run_turn(session, deps, _config())
-
-    assert tts.spoken == ["Result is in."]
-    for spoken in tts.spoken:
-        assert "<" not in spoken and "tool" not in spoken
     assert executor.calls == [{"name": "shell", "arguments": {}}]
 
 
@@ -326,7 +356,7 @@ async def test_acknowledgement_text_is_split_normally(fake_capture: None) -> Non
                 " now",
                 ".",
                 " ",
-                _tool_call_token("shell", {}),
+                _tool_call_event("shell", {}),
             ],
             ["Found nothing."],
         ]
@@ -389,7 +419,7 @@ async def test_tool_execution_error_feeds_user_message_back_to_llm(
     stt = FakeSTT(text="run it")
     llm = FakeLLM(
         responses=[
-            [_tool_call_token("shell", {})],
+            [_tool_call_event("shell", {})],
             ["All set."],
         ]
     )
@@ -409,6 +439,7 @@ async def test_tool_execution_error_feeds_user_message_back_to_llm(
     assert second_messages[-1] == {
         "role": "tool",
         "content": "I encountered an error running shell.",
+        "name": "shell",
     }
     assert tts.spoken == ["All set."]
 
@@ -417,8 +448,7 @@ async def test_tool_execution_error_feeds_user_message_back_to_llm(
 async def test_safety_cap_terminates_runaway_tool_loop(fake_capture: None) -> None:
     stt = FakeSTT(text="loop forever")
     # Every LLM response is yet another tool call.
-    tool_token = _tool_call_token("shell", {})
-    llm = FakeLLM(responses=[[tool_token]] * 20)
+    llm = FakeLLM(responses=[[_tool_call_event("shell", {})]] * 20)
     tts = FakeTTS()
     player = FakePlayer()
     executor = FakeExecutor(results=["ok"] * 20)
@@ -441,12 +471,11 @@ async def test_consumer_drains_queue_before_tool_runs(fake_capture: None) -> Non
                 "First sentence. ",
                 "Second sentence. ",
                 "Third sentence. ",
-                _tool_call_token("shell", {}),
+                _tool_call_event("shell", {}),
             ],
             ["Done."],
         ]
     )
-    tts = FakeTTS()
     player = FakePlayer()
 
     # Record relative ordering of TTS calls vs executor calls.
@@ -486,6 +515,87 @@ async def test_consumer_drains_queue_before_tool_runs(fake_capture: None) -> Non
     ]
     # And the post-tool reply was spoken last.
     assert event_log[-1] == "tts:Done."
+
+
+# ---------------------------------------------------------------------------
+# Tool declarations & emoji stripping
+# ---------------------------------------------------------------------------
+
+
+class _FakeSearchTool(BaseTool):
+    name = "web_search"
+    description = "Search the web."
+    schema: ClassVar[dict[str, Any]] = {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    }
+
+    def execute(self, params: dict[str, Any]) -> str:
+        return ""
+
+
+@pytest.mark.asyncio
+async def test_tools_forwarded_to_llm(fake_capture: None) -> None:
+    stt = FakeSTT(text="hi")
+    llm = FakeLLM(responses=[["Hello."]])
+    tts = FakeTTS()
+    player = FakePlayer()
+    executor = FakeExecutor(results=[])
+    deps = _build_deps(
+        stt=stt,
+        llm=llm,
+        tts=tts,
+        player=player,
+        executor=executor,
+        tools=[_FakeSearchTool()],
+    )
+
+    await run_turn(Session(), deps, _config())
+
+    assert llm.tools_calls == [
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web.",
+                    "parameters": _FakeSearchTool.schema,
+                },
+            }
+        ]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_emoji_is_stripped_before_tts(fake_capture: None) -> None:
+    stt = FakeSTT(text="hi")
+    llm = FakeLLM(responses=[["Hello! \U0001F44B ", "How are you? \U0001F31F"]])
+    tts = FakeTTS()
+    player = FakePlayer()
+    executor = FakeExecutor(results=[])
+    deps = _build_deps(stt=stt, llm=llm, tts=tts, player=player, executor=executor)
+
+    await run_turn(Session(), deps, _config())
+
+    assert tts.spoken == ["Hello!", "How are you?"]
+    for spoken in tts.spoken:
+        assert "\U0001F44B" not in spoken
+        assert "\U0001F31F" not in spoken
+
+
+@pytest.mark.asyncio
+async def test_pure_emoji_sentence_is_dropped(fake_capture: None) -> None:
+    stt = FakeSTT(text="hi")
+    llm = FakeLLM(responses=[["\U0001F600\U0001F600\U0001F600. "]])
+    tts = FakeTTS()
+    player = FakePlayer()
+    executor = FakeExecutor(results=[])
+    deps = _build_deps(stt=stt, llm=llm, tts=tts, player=player, executor=executor)
+
+    await run_turn(Session(), deps, _config())
+
+    assert tts.spoken == []
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +683,7 @@ async def test_barge_in_before_tool_call_skips_tool_execution(
     stt = FakeSTT(text="search")
     llm = FakeLLM(
         responses=[
-            ["Working. ", _tool_call_token("shell", {})],
+            ["Working. ", _tool_call_event("shell", {})],
             ["Should never run."],
         ]
     )

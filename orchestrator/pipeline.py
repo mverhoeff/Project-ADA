@@ -2,16 +2,17 @@
 
 One :func:`run_turn` call performs a full conversational round-trip:
 
-    microphone capture → STT → LLM token stream → sentence splitter
+    microphone capture → STT → LLM event stream → sentence splitter
                        ↘ asyncio.Queue ↗
                                               → TTS → audio playback
 
 The LLM stream and TTS playback run as two concurrent ``asyncio`` tasks,
 so the user starts hearing the response while the model is still
 generating it. A leading "acknowledgement" sentence (PLAN.md §13) plays
-immediately while a parallel scan watches for ``<tool_call>…</tool_call>``
-in the accumulated text. When detected, the producer stops feeding the
-sentence splitter, the consumer drains the queue (so any acknowledgement
+immediately. The LLM yields a typed event stream — :class:`TextChunk`
+events feed the sentence splitter, while a :class:`ToolCallChunk` event
+flips the producer into tool mode: it stops feeding the queue, the
+consumer drains whatever was already enqueued (so the acknowledgement
 finishes playing), the tool runs, and the LLM is re-invoked for its
 final reply within the same turn.
 """
@@ -19,11 +20,11 @@ final reply within the same turn.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from agent.executor import ToolExecutor
-from agent.router import detect_tool_call
 from agent.tools.base import BaseTool
 from core.exceptions import ServiceUnavailableError, ToolExecutionError
 from core.logger import get_logger
@@ -33,17 +34,35 @@ from orchestrator.barge_in import BargeInListener
 from orchestrator.sentence_splitter import SentenceSplitter
 from orchestrator.session import Session
 from services.llm.client import LLMClient
-from services.llm.prompt_builder import build_messages
+from services.llm.events import TextChunk, ToolCallChunk
+from services.llm.prompt_builder import build_messages, build_tools
 from services.stt.client import STTClient
 from services.tts.client import TTSClient
 
 _log = get_logger(__name__)
 
-_TOOL_OPEN = "<tool_call>"
-_TOOL_CLOSE = "</tool_call>"
-_TAIL_KEEP = len(_TOOL_OPEN) - 1
 _DEFAULT_QUEUE_SIZE = 5
 _DEFAULT_MAX_TOOL_ITERATIONS = 10
+
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F680-\U0001F6FF"  # transport & map
+    "\U0001F700-\U0001F77F"  # alchemical
+    "\U0001F780-\U0001F7FF"  # geometric shapes ext
+    "\U0001F800-\U0001F8FF"  # supplemental arrows-C
+    "\U0001F900-\U0001F9FF"  # supplemental pictographs
+    "\U0001FA00-\U0001FA6F"  # chess / symbols
+    "\U0001FA70-\U0001FAFF"  # symbols & pictographs ext-A
+    "\U00002600-\U000026FF"  # miscellaneous symbols
+    "\U00002700-\U000027BF"  # dingbats
+    "\U0001F1E6-\U0001F1FF"  # regional indicators (flags)
+    "\U0000FE0F"             # variation selector-16
+    "\U0000200D"             # zero-width joiner
+    "]+",
+    flags=re.UNICODE,
+)
 
 
 @dataclass
@@ -104,11 +123,13 @@ async def run_turn(
         return False
     session.add_message("user", transcript)
 
+    tools_decl = build_tools(deps.tools)
+
     for _ in range(max_tool_iters):
         messages = build_messages(session, deps.tools)
         try:
             tool_call, assistant_text, barge_in_occurred = await _stream_with_tts(
-                deps, messages, config
+                deps, messages, tools_decl, config
             )
         except ServiceUnavailableError as e:
             _log.warning("turn_stream_unavailable", error=str(e))
@@ -116,21 +137,38 @@ async def run_turn(
             session.add_message("assistant", e.user_message)
             return False
 
-        if assistant_text:
-            session.add_message("assistant", assistant_text)
-
         if barge_in_occurred:
+            if assistant_text:
+                session.add_message("assistant", assistant_text)
             return True
 
         if tool_call is None:
+            if assistant_text:
+                session.add_message("assistant", assistant_text)
             return False
+
+        # Persist the assistant turn with its structured tool_calls so the
+        # next LLM iteration sees a coherent user → (assistant+tool_call) →
+        # tool exchange. Without this the model retries the same call.
+        session.add_message(
+            "assistant",
+            assistant_text,
+            tool_calls=[
+                {
+                    "function": {
+                        "name": tool_call["name"],
+                        "arguments": tool_call["arguments"],
+                    }
+                }
+            ],
+        )
 
         try:
             result = await asyncio.to_thread(deps.executor.execute, tool_call)
         except ToolExecutionError as e:
             _log.warning("tool_execution_failed", error=str(e))
             result = e.user_message
-        session.add_message("tool", result)
+        session.add_message("tool", result, name=tool_call["name"])
 
     _log.warning("turn_max_tool_iterations_exceeded", limit=max_tool_iters)
     return False
@@ -139,14 +177,16 @@ async def run_turn(
 async def _stream_with_tts(
     deps: PipelineDeps,
     messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
     config: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str, bool]:
     """Run the Producer/Consumer pair for a single LLM stream.
 
     Returns ``(tool_call_or_none, full_assistant_text, barge_in_occurred)``.
-    The assistant text is the verbatim concatenation of every token the
-    LLM emitted before completion or interruption, including any
-    ``<tool_call>…</tool_call>`` block.
+    The assistant text is the verbatim concatenation of every spoken
+    token the LLM emitted before tool invocation or completion. Tool
+    calls travel through the structured event channel and never appear
+    in the spoken text.
 
     When ``deps.barge_in`` is set, a background listener races against
     the streaming pair. If the listener fires before streaming
@@ -163,47 +203,20 @@ async def _stream_with_tts(
     async def producer() -> None:
         nonlocal detected_tool
         splitter = SentenceSplitter()
-        pending = ""
-        in_tool_text = False
         try:
-            async for token in deps.llm.stream_chat(messages):
-                accumulated.append(token)
-                full = "".join(accumulated)
-
-                if in_tool_text:
-                    tc = detect_tool_call(full)
-                    if tc is not None:
-                        detected_tool = tc
-                        return
-                    continue
-
-                pending += token
-                open_idx = pending.find(_TOOL_OPEN)
-                if open_idx >= 0:
-                    safe = pending[:open_idx]
-                    if safe:
-                        for sentence in splitter.feed(safe):
-                            await _safe_put(queue, sentence)
-                    pending = ""
-                    in_tool_text = True
-                    tc = detect_tool_call(full)
-                    if tc is not None:
-                        detected_tool = tc
-                        return
-                    continue
-
-                if len(pending) > _TAIL_KEEP:
-                    safe = pending[:-_TAIL_KEEP]
-                    pending = pending[-_TAIL_KEEP:]
-                    for sentence in splitter.feed(safe):
-                        await _safe_put(queue, sentence)
-
-            if not in_tool_text:
-                if pending:
-                    for sentence in splitter.feed(pending):
-                        await _safe_put(queue, sentence)
-                for sentence in splitter.flush():
+            async for event in deps.llm.stream_chat(messages, tools=tools):
+                if isinstance(event, ToolCallChunk):
+                    detected_tool = {
+                        "name": event.name,
+                        "arguments": event.arguments,
+                    }
+                    return
+                # TextChunk
+                accumulated.append(event.text)
+                for sentence in splitter.feed(event.text):
                     await _safe_put(queue, sentence)
+            for sentence in splitter.flush():
+                await _safe_put(queue, sentence)
         finally:
             await queue.put(None)
 
@@ -286,11 +299,14 @@ async def _await_streaming(
 
 
 async def _safe_put(queue: asyncio.Queue[str | None], sentence: str) -> None:
-    """Drop empty / tool-call-tainted sentences before queuing."""
-    cleaned = sentence.strip()
-    if not cleaned:
-        return
-    if _TOOL_OPEN in cleaned or _TOOL_CLOSE in cleaned:
+    """Strip emojis and drop unspoken sentences before queuing for TTS.
+
+    A sentence with no alphanumeric character left after emoji removal
+    (e.g. ``"😀😀😀."`` → ``"."``) is dropped — TTS pronouncing bare
+    punctuation is worse than silence.
+    """
+    cleaned = _EMOJI_RE.sub("", sentence).strip()
+    if not cleaned or not re.search(r"\w", cleaned):
         return
     await queue.put(cleaned)
 

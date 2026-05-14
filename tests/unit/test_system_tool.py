@@ -10,7 +10,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.tools import build_registry
-from agent.tools.system_tool import FileReadTool, ShellTool, SystemInfoTool
+from agent.tools.system_tool import (
+    FileReadTool,
+    ShellTool,
+    SystemInfoTool,
+    _query_cpu_temp,
+    _query_gpu_stats,
+)
 from core.exceptions import ToolExecutionError
 
 _ALLOWED_DIR = "/tmp/ada_test_allowed"
@@ -132,14 +138,53 @@ def test_system_info_returns_json_with_expected_keys() -> None:
             "agent.tools.system_tool.psutil.disk_usage",
             return_value=MagicMock(percent=66.6),
         ),
+        patch("agent.tools.system_tool._query_cpu_temp", return_value=48.0),
+        patch(
+            "agent.tools.system_tool._query_gpu_stats",
+            return_value={
+                "vram_used_mb": 6000.0,
+                "vram_total_mb": 8000.0,
+                "vram_percent": 75.0,
+                "temp_celsius": 61.0,
+            },
+        ),
     ):
         result = tool.execute({})
     parsed = json.loads(result)
     assert parsed == {
         "cpu_percent": 42.0,
+        "cpu_temp_celsius": 48.0,
         "memory_percent": 55.5,
         "disk_percent": 66.6,
+        "gpu_temp_celsius": 61.0,
+        "vram_percent": 75.0,
+        "vram_used_mb": 6000.0,
+        "vram_total_mb": 8000.0,
     }
+
+
+def test_system_info_reports_nulls_when_helpers_unavailable() -> None:
+    tool = SystemInfoTool()
+    with (
+        patch("agent.tools.system_tool.psutil.cpu_percent", return_value=1.0),
+        patch(
+            "agent.tools.system_tool.psutil.virtual_memory",
+            return_value=MagicMock(percent=1.0),
+        ),
+        patch(
+            "agent.tools.system_tool.psutil.disk_usage",
+            return_value=MagicMock(percent=1.0),
+        ),
+        patch("agent.tools.system_tool._query_cpu_temp", return_value=None),
+        patch("agent.tools.system_tool._query_gpu_stats", return_value=None),
+    ):
+        result = tool.execute({})
+    parsed = json.loads(result)
+    assert parsed["cpu_temp_celsius"] is None
+    assert parsed["gpu_temp_celsius"] is None
+    assert parsed["vram_percent"] is None
+    assert parsed["vram_used_mb"] is None
+    assert parsed["vram_total_mb"] is None
 
 
 def test_system_info_uses_non_blocking_cpu_sample() -> None:
@@ -156,9 +201,84 @@ def test_system_info_uses_non_blocking_cpu_sample() -> None:
             "agent.tools.system_tool.psutil.disk_usage",
             return_value=MagicMock(percent=1.0),
         ),
+        patch("agent.tools.system_tool._query_cpu_temp", return_value=None),
+        patch("agent.tools.system_tool._query_gpu_stats", return_value=None),
     ):
         tool.execute({})
     assert mock_cpu.call_args.kwargs.get("interval") is None
+
+
+# -- _query_gpu_stats --------------------------------------------------------
+
+
+def test_query_gpu_stats_parses_nvidia_smi_csv() -> None:
+    fake = _mock_run(stdout="6000, 8000, 61\n")
+    with patch("agent.tools.system_tool.subprocess.run", return_value=fake):
+        stats = _query_gpu_stats()
+    assert stats == {
+        "vram_used_mb": 6000.0,
+        "vram_total_mb": 8000.0,
+        "vram_percent": 75.0,
+        "temp_celsius": 61.0,
+    }
+
+
+def test_query_gpu_stats_returns_none_when_nvidia_smi_missing() -> None:
+    with patch(
+        "agent.tools.system_tool.subprocess.run",
+        side_effect=FileNotFoundError,
+    ):
+        assert _query_gpu_stats() is None
+
+
+def test_query_gpu_stats_returns_none_on_timeout() -> None:
+    with patch(
+        "agent.tools.system_tool.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd="nvidia-smi", timeout=5),
+    ):
+        assert _query_gpu_stats() is None
+
+
+def test_query_gpu_stats_returns_none_on_nonzero_exit() -> None:
+    fake = _mock_run(stdout="", stderr="error", returncode=1)
+    with patch("agent.tools.system_tool.subprocess.run", return_value=fake):
+        assert _query_gpu_stats() is None
+
+
+def test_query_gpu_stats_returns_none_on_parse_error() -> None:
+    fake = _mock_run(stdout="garbage output\n")
+    with patch("agent.tools.system_tool.subprocess.run", return_value=fake):
+        assert _query_gpu_stats() is None
+
+
+# -- _query_cpu_temp ---------------------------------------------------------
+
+
+def test_query_cpu_temp_reads_first_known_key() -> None:
+    with patch(
+        "agent.tools.system_tool.psutil.sensors_temperatures",
+        create=True,
+        return_value={"coretemp": [MagicMock(current=48.0)]},
+    ):
+        assert _query_cpu_temp() == 48.0
+
+
+def test_query_cpu_temp_returns_none_when_empty() -> None:
+    with patch(
+        "agent.tools.system_tool.psutil.sensors_temperatures",
+        create=True,
+        return_value={},
+    ):
+        assert _query_cpu_temp() is None
+
+
+def test_query_cpu_temp_returns_none_on_not_implemented() -> None:
+    with patch(
+        "agent.tools.system_tool.psutil.sensors_temperatures",
+        create=True,
+        side_effect=NotImplementedError,
+    ):
+        assert _query_cpu_temp() is None
 
 
 # -- FileReadTool ------------------------------------------------------------

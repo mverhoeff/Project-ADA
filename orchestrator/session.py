@@ -31,9 +31,16 @@ class Session:
     is_speaking: bool = False
     platform: str = ""
 
-    def add_message(self, role: str, content: str) -> None:
-        """Append a message to the history."""
-        self.history.append({"role": role, "content": content})
+    def add_message(self, role: str, content: str, **extra: Any) -> None:
+        """Append a message to the history.
+
+        Extra keyword arguments (e.g. ``tool_calls=[...]``, ``name="..."``)
+        are merged into the message dict so callers can record Ollama
+        chat-format fields beyond the basic ``role``/``content`` pair.
+        """
+        msg: dict[str, Any] = {"role": role, "content": content}
+        msg.update(extra)
+        self.history.append(msg)
 
     def trim_to(self, max_turns: int) -> None:
         """Drop oldest non-system messages until at most ``max_turns`` pairs remain.

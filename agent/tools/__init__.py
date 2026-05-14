@@ -31,8 +31,8 @@ def build_registry(config: dict[str, Any]) -> dict[str, BaseTool]:
         OpenAppTool(),
     ]
     if bool(config.get("agent", {}).get("browser_enabled", True)):
+        tools.append(WebSearchTool(config))
         worker = _BrowserWorker(config)
-        tools.append(WebSearchTool(worker, config))
         tools.append(WebFetchTool(worker, config))
     return {t.name: t for t in tools}
 

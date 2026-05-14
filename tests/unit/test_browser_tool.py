@@ -1,6 +1,8 @@
 """Unit tests for :mod:`agent.tools.browser_tool`.
 
-All tests are fully mocked — no Playwright import, no Chromium launch.
+All tests are fully mocked — no Playwright import, no Chromium launch, no
+network. ``ddgs.DDGS`` is patched out for :class:`WebSearchTool` so the
+test suite never touches DuckDuckGo.
 """
 
 from __future__ import annotations
@@ -15,7 +17,6 @@ from agent.tools.browser_tool import (
     WebFetchTool,
     WebSearchTool,
     _BrowserWorker,
-    _unwrap_ddg_redirect,
     format_fetch_result,
     format_results,
 )
@@ -36,8 +37,22 @@ _BASE_CONFIG: dict[str, Any] = {
 
 def _tool(config: dict[str, Any] | None = None) -> WebSearchTool:
     cfg = config if config is not None else _BASE_CONFIG
-    worker = MagicMock(spec=_BrowserWorker)
-    return WebSearchTool(worker, cfg)
+    return WebSearchTool(cfg)
+
+
+def _patch_ddgs(results: list[dict[str, str]] | Exception) -> Any:
+    """Return a context manager that patches ``ddgs.DDGS`` for the test.
+
+    Pass a list of ``{title, href, body}`` dicts for a successful query,
+    or an Exception instance to simulate a ddgs failure.
+    """
+    mock_ddgs_cls = MagicMock()
+    instance = mock_ddgs_cls.return_value
+    if isinstance(results, Exception):
+        instance.text.side_effect = results
+    else:
+        instance.text.return_value = iter(results)
+    return patch("ddgs.DDGS", mock_ddgs_cls), mock_ddgs_cls
 
 
 def test_metadata_is_complete() -> None:
@@ -55,45 +70,67 @@ def test_schema_requires_only_query() -> None:
     assert props["max_results"]["type"] == "integer"
 
 
-def test_execute_delegates_to_worker_with_default_max() -> None:
+def test_execute_returns_formatted_results() -> None:
     tool = _tool()
-    tool._worker.call.return_value = "RESULTS"  # type: ignore[attr-defined]
-    out = tool.execute({"query": "berlin weather"})
-    assert out == "RESULTS"
-    tool._worker.call.assert_called_once_with(  # type: ignore[attr-defined]
-        "search", query="berlin weather", max_results=5
+    raw = [
+        {
+            "title": "Python (programming language)",
+            "href": "https://en.wikipedia.org/wiki/Python",
+            "body": "An interpreted, high-level language.",
+        },
+        {
+            "title": "Python.org",
+            "href": "https://www.python.org",
+            "body": "Official site.",
+        },
+    ]
+    ctx, mock_ddgs_cls = _patch_ddgs(raw)
+    with ctx:
+        out = tool.execute({"query": "python programming"})
+
+    assert "1. Python (programming language)" in out
+    assert "https://en.wikipedia.org/wiki/Python" in out
+    assert "An interpreted, high-level language." in out
+    assert "2. Python.org" in out
+
+    mock_ddgs_cls.return_value.text.assert_called_once_with(
+        "python programming", max_results=5
     )
 
 
 def test_execute_strips_query_whitespace() -> None:
     tool = _tool()
-    tool._worker.call.return_value = "ok"  # type: ignore[attr-defined]
-    tool.execute({"query": "  hello world  "})
-    args, kwargs = tool._worker.call.call_args  # type: ignore[attr-defined]
-    assert kwargs["query"] == "hello world"
+    ctx, mock_ddgs_cls = _patch_ddgs([])
+    with ctx:
+        tool.execute({"query": "  hello world  "})
+    args, kwargs = mock_ddgs_cls.return_value.text.call_args
+    assert args[0] == "hello world"
 
 
 def test_execute_clamps_max_results_above_default() -> None:
     tool = _tool()
-    tool._worker.call.return_value = "ok"  # type: ignore[attr-defined]
-    tool.execute({"query": "q", "max_results": 999})
-    _, kwargs = tool._worker.call.call_args  # type: ignore[attr-defined]
+    ctx, mock_ddgs_cls = _patch_ddgs([])
+    with ctx:
+        tool.execute({"query": "q", "max_results": 999})
+    _, kwargs = mock_ddgs_cls.return_value.text.call_args
     assert kwargs["max_results"] == 5
 
 
 def test_execute_clamps_max_results_below_one() -> None:
     tool = _tool()
-    tool._worker.call.return_value = "ok"  # type: ignore[attr-defined]
-    tool.execute({"query": "q", "max_results": 0})
-    _, kwargs = tool._worker.call.call_args  # type: ignore[attr-defined]
+    ctx, mock_ddgs_cls = _patch_ddgs([])
+    with ctx:
+        tool.execute({"query": "q", "max_results": 0})
+    _, kwargs = mock_ddgs_cls.return_value.text.call_args
     assert kwargs["max_results"] == 1
 
 
 def test_execute_handles_non_numeric_max_results() -> None:
     tool = _tool()
-    tool._worker.call.return_value = "ok"  # type: ignore[attr-defined]
-    tool.execute({"query": "q", "max_results": "lots"})
-    _, kwargs = tool._worker.call.call_args  # type: ignore[attr-defined]
+    ctx, mock_ddgs_cls = _patch_ddgs([])
+    with ctx:
+        tool.execute({"query": "q", "max_results": "lots"})
+    _, kwargs = mock_ddgs_cls.return_value.text.call_args
     assert kwargs["max_results"] == 5
 
 
@@ -101,7 +138,6 @@ def test_execute_rejects_empty_query() -> None:
     tool = _tool()
     with pytest.raises(ToolExecutionError):
         tool.execute({"query": "   "})
-    tool._worker.call.assert_not_called()  # type: ignore[attr-defined]
 
 
 def test_execute_rejects_missing_query() -> None:
@@ -110,14 +146,21 @@ def test_execute_rejects_missing_query() -> None:
         tool.execute({})
 
 
-def test_execute_propagates_worker_tool_execution_error() -> None:
+def test_execute_wraps_ddgs_exception_as_tool_error() -> None:
     tool = _tool()
-    tool._worker.call.side_effect = ToolExecutionError(  # type: ignore[attr-defined]
-        "boom", "I couldn't reach the web right now."
-    )
-    with pytest.raises(ToolExecutionError) as exc_info:
-        tool.execute({"query": "anything"})
-    assert "reach the web" in exc_info.value.user_message
+    ctx, _ = _patch_ddgs(RuntimeError("network down"))
+    with ctx:
+        with pytest.raises(ToolExecutionError) as exc_info:
+            tool.execute({"query": "anything"})
+    assert "search failed" in exc_info.value.user_message.lower()
+
+
+def test_execute_returns_no_results_message_when_empty() -> None:
+    tool = _tool()
+    ctx, _ = _patch_ddgs([])
+    with ctx:
+        out = tool.execute({"query": "nothing"})
+    assert out == "No results found."
 
 
 def test_format_results_layout() -> None:
@@ -145,20 +188,6 @@ def test_format_results_missing_fields() -> None:
     # No crash when snippet/url absent.
 
 
-def test_unwrap_ddg_redirect_real_target() -> None:
-    href = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fwiki.example%2Fpage&rut=abc"
-    assert _unwrap_ddg_redirect(href) == "https://wiki.example/page"
-
-
-def test_unwrap_ddg_redirect_passthrough() -> None:
-    href = "https://direct.example/page"
-    assert _unwrap_ddg_redirect(href) == href
-
-
-def test_unwrap_ddg_redirect_protocol_relative() -> None:
-    assert _unwrap_ddg_redirect("//direct.example/page") == "https://direct.example/page"
-
-
 def test_worker_start_error_is_sticky_and_raises_on_call() -> None:
     worker = _BrowserWorker(_BASE_CONFIG)
     sentinel = ToolExecutionError("nope", "Browser broken.")
@@ -168,7 +197,7 @@ def test_worker_start_error_is_sticky_and_raises_on_call() -> None:
     # start error from a previous attempt.
     with patch("threading.Thread") as mock_thread:
         with pytest.raises(ToolExecutionError) as exc_info:
-            worker.call("search", query="q", max_results=1)
+            worker.call("fetch", url="https://example.com", max_chars=4000)
         mock_thread.assert_not_called()
     assert exc_info.value is sentinel
 
@@ -189,7 +218,7 @@ def test_worker_call_re_raises_error_payload_from_response_queue() -> None:
     worker._req_queue.put = fake_put  # type: ignore[method-assign]
 
     with pytest.raises(ToolExecutionError) as exc_info:
-        worker.call("search", query="q", max_results=1)
+        worker.call("fetch", url="https://example.com", max_chars=4000)
     assert exc_info.value is boom
 
 
@@ -205,7 +234,7 @@ def test_worker_call_returns_payload_on_ok() -> None:
 
     worker._req_queue.put = fake_put  # type: ignore[method-assign]
 
-    assert worker.call("search", query="q", max_results=1) == "PAYLOAD"
+    assert worker.call("fetch", url="https://example.com", max_chars=4000) == "PAYLOAD"
 
 
 def test_registry_includes_web_search_when_enabled() -> None:
@@ -363,7 +392,7 @@ def test_format_fetch_result_handles_empty_text() -> None:
     assert "[source: u]" in out
 
 
-# -- registry / shared-worker checks ----------------------------------------
+# -- registry / fetch worker checks -----------------------------------------
 
 
 def test_registry_includes_web_fetch_when_browser_enabled() -> None:
@@ -384,10 +413,3 @@ def test_registry_omits_web_fetch_when_browser_disabled() -> None:
     registry = build_registry(config)
     assert "web_fetch" not in registry
     assert "web_search" not in registry
-
-
-def test_web_fetch_shares_worker_with_web_search() -> None:
-    registry = build_registry(_BASE_CONFIG)
-    search = registry["web_search"]
-    fetch = registry["web_fetch"]
-    assert search._worker is fetch._worker  # type: ignore[attr-defined]

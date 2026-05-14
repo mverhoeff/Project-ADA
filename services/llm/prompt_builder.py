@@ -1,12 +1,14 @@
-"""Assemble the messages list sent to Ollama on each turn.
+"""Assemble the messages list and tool declarations sent to Ollama.
 
-Builds the system prompt (persona + tool declarations + date + platform)
-and prepends it to the session history. Pure function — no I/O, no async.
+:func:`build_messages` returns the system prompt (persona + date + platform)
+prepended to the session history. :func:`build_tools` returns Ollama-format
+function declarations to pass alongside via the ``/api/chat`` ``tools``
+field; tool calls then arrive in the response's structured ``tool_calls``
+field rather than embedded in content. Pure functions — no I/O, no async.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import date
 from typing import TYPE_CHECKING, Any
 
@@ -18,24 +20,31 @@ if TYPE_CHECKING:
 _PERSONA = (
     "You are ADA, a helpful local voice assistant. Reply concisely and "
     "naturally; your replies are spoken aloud, so avoid markdown, code "
-    "fences, or long lists unless the user explicitly asks for them. "
-    "When you decide to use a tool, first say in one short sentence what "
-    "you are about to do (for example, \"Searching the web now...\"), "
-    "then emit the tool_call JSON."
+    "fences, emojis, or long lists unless the user explicitly asks for them. "
+    "Never include emoji characters in your responses. "
+    "When you must enumerate items, speak them naturally — join them with "
+    "commas and \"and\" (e.g. \"apples, oranges, and bananas\"), or use "
+    "phrases like \"first\", \"second\", \"third\". Never output bulleted "
+    "or numbered lines. "
+    "When you need to use a tool, first say in one short sentence what you "
+    "are about to do (for example, \"Searching the web now...\"), then "
+    "invoke the tool via the native tool-calling interface — do not write "
+    "tool calls as text."
 )
 
 
 def build_messages(
     session: Session,
-    tools: list[BaseTool] | None = None,
+    tools: list[BaseTool] | None = None,  # noqa: ARG001 - kept for callsite symmetry
 ) -> list[dict[str, Any]]:
     """Build the full ``messages`` list to send to the LLM.
 
     Args:
         session: Current conversation session. Its ``history`` is appended
             verbatim after the system message.
-        tools: Tools to declare to the LLM. ``None`` or empty omits the
-            tool block entirely.
+        tools: Accepted for callsite symmetry with :func:`build_tools` but
+            no longer embedded in the system prompt — tool declarations
+            travel through Ollama's native ``tools`` request field.
 
     Returns:
         A list whose first element is the system message and whose
@@ -46,19 +55,34 @@ def build_messages(
         f"Today's date: {date.today().isoformat()}",
         f"Operating system: {session.platform or 'unknown'}",
     ]
-
-    if tools:
-        parts.append("Available tools (respond with a tool_use JSON block to invoke):")
-        for tool in tools:
-            declaration = {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.schema,
-                },
-            }
-            parts.append(json.dumps(declaration))
-
     system_content = "\n".join(parts)
     return [{"role": "system", "content": system_content}, *session.history]
+
+
+def build_tools(
+    tools: list[BaseTool] | None,
+) -> list[dict[str, Any]] | None:
+    """Convert ``BaseTool`` instances into Ollama-format function declarations.
+
+    Args:
+        tools: Registered tools, or ``None``/empty if the LLM should be
+            invoked without tool access.
+
+    Returns:
+        A list of ``{"type": "function", "function": {...}}`` entries
+        suitable for the Ollama ``/api/chat`` ``tools`` field, or ``None``
+        when there are no tools (so the client omits the field entirely).
+    """
+    if not tools:
+        return None
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.schema,
+            },
+        }
+        for t in tools
+    ]

@@ -7,7 +7,7 @@ from typing import Any
 
 from agent.tools.base import BaseTool
 from orchestrator.session import Session
-from services.llm.prompt_builder import build_messages
+from services.llm.prompt_builder import build_messages, build_tools
 
 
 class _SearchTool(BaseTool):
@@ -50,13 +50,14 @@ def test_system_contains_today_date() -> None:
     assert date.today().isoformat() in messages[0]["content"]
 
 
-def test_tools_declared_in_system() -> None:
+def test_tools_not_declared_in_system_when_native_tool_calling_used() -> None:
     tools = [_SearchTool(), _ReadFileTool()]
     messages = build_messages(Session(platform="linux"), tools=tools)
     system_content = messages[0]["content"]
-    assert "search" in system_content
-    assert "read_file" in system_content
-    assert "Search the web." in system_content
+    assert "Search the web." not in system_content
+    assert "read_file" not in system_content
+    assert "Available tools" not in system_content
+    assert '"function"' not in system_content
 
 
 def test_history_appended_after_system() -> None:
@@ -97,3 +98,39 @@ def test_history_passed_through_unchanged() -> None:
     session = Session(platform="linux", history=history)
     messages = build_messages(session)
     assert messages[1:] == history
+
+
+def test_persona_forbids_emojis() -> None:
+    messages = build_messages(Session(platform="linux"))
+    assert "emoji" in messages[0]["content"].lower()
+
+
+def test_build_tools_returns_ollama_format() -> None:
+    tools = [_SearchTool(), _ReadFileTool()]
+    decls = build_tools(tools)
+    assert decls == [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search the web.",
+                "parameters": _SearchTool.schema,
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file from disk.",
+                "parameters": _ReadFileTool.schema,
+            },
+        },
+    ]
+
+
+def test_build_tools_none_when_empty_list() -> None:
+    assert build_tools([]) is None
+
+
+def test_build_tools_none_when_none() -> None:
+    assert build_tools(None) is None

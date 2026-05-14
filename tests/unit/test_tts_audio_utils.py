@@ -66,6 +66,14 @@ def test_preprocess_strips_numbered_bullet() -> None:
     assert preprocess_text("1. ordered item") == "ordered item"
 
 
+def test_preprocess_joins_multiline_bullets_with_commas() -> None:
+    assert preprocess_text("- apple\n- banana\n- cherry") == "apple, banana, cherry"
+
+
+def test_preprocess_joins_numbered_multiline_bullets_with_commas() -> None:
+    assert preprocess_text("1. apple\n2. banana\n3. cherry") == "apple, banana, cherry"
+
+
 def test_preprocess_strips_markdown_link() -> None:
     assert (
         preprocess_text("See [the docs](https://example.com) for more")

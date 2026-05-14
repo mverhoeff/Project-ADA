@@ -1,7 +1,10 @@
 """Async streaming client for the local Ollama server.
 
-Wraps the ``/api/chat`` endpoint with ``stream=True``. Yields token strings
-as they arrive. Connection errors and non-200 responses are translated to
+Wraps the ``/api/chat`` endpoint with ``stream=True``. Yields typed
+:class:`~services.llm.events.StreamEvent` values — :class:`TextChunk` for
+spoken content and :class:`ToolCallChunk` for structured tool invocations
+parsed from Ollama's ``message.tool_calls`` field. Connection errors and
+non-200 responses are translated to
 :class:`core.exceptions.ServiceUnavailableError` so the orchestrator can
 surface a spoken error to the user.
 """
@@ -15,6 +18,7 @@ from typing import Any
 import httpx
 
 from core.exceptions import ServiceUnavailableError
+from services.llm.events import StreamEvent, TextChunk, ToolCallChunk
 
 
 _USER_FACING_ERROR = "I can't reach my language model right now."
@@ -47,15 +51,19 @@ class LLMClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-    ) -> AsyncIterator[str]:
-        """Yield token strings from the LLM stream.
+    ) -> AsyncIterator[StreamEvent]:
+        """Yield typed events from the LLM stream.
 
         Args:
             messages: Chat history in Ollama format.
-            tools: Optional tool declarations to include in the request.
+            tools: Optional Ollama-format tool declarations. When non-empty,
+                Ollama may emit ``tool_calls`` in its response, which are
+                yielded as :class:`ToolCallChunk` events.
 
         Yields:
-            Incremental ``content`` strings from each streamed chunk.
+            :class:`TextChunk` for spoken content tokens, in order, and
+            :class:`ToolCallChunk` for any structured tool invocation
+            Ollama produces.
 
         Raises:
             ServiceUnavailableError: If Ollama is unreachable, times out,
@@ -90,9 +98,27 @@ class LLMClient:
                             chunk = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        content = chunk.get("message", {}).get("content")
+
+                        message = chunk.get("message", {}) or {}
+                        content = message.get("content")
                         if content:
-                            yield content
+                            yield TextChunk(text=content)
+
+                        for call in message.get("tool_calls") or []:
+                            fn = call.get("function", {}) or {}
+                            name = fn.get("name")
+                            if not name:
+                                continue
+                            args = fn.get("arguments") or {}
+                            if isinstance(args, str):
+                                try:
+                                    args = json.loads(args)
+                                except json.JSONDecodeError:
+                                    args = {}
+                            if not isinstance(args, dict):
+                                args = {}
+                            yield ToolCallChunk(name=name, arguments=args)
+
                         if chunk.get("done"):
                             return
         except (httpx.ConnectError, httpx.TimeoutException, httpx.TransportError) as e:

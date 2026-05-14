@@ -105,6 +105,16 @@ def test_persona_forbids_emojis() -> None:
     assert "emoji" in messages[0]["content"].lower()
 
 
+def test_persona_forbids_reading_urls_aloud() -> None:
+    content = build_messages(Session(platform="linux"))[0]["content"].lower()
+    assert "url" in content
+
+
+def test_persona_says_to_answer_from_results_not_sources() -> None:
+    content = build_messages(Session(platform="linux"))[0]["content"].lower()
+    assert "source" in content
+
+
 def test_build_tools_returns_ollama_format() -> None:
     tools = [_SearchTool(), _ReadFileTool()]
     decls = build_tools(tools)

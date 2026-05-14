@@ -25,6 +25,9 @@ agent:
   browser_max_results: 5
   browser_navigation_timeout_ms: 15000
   web_fetch_max_chars: 4000
+  web_search_fetch_count: 3        # top-N result pages fetched for real content
+  web_search_excerpt_chars: 1000   # per-result extracted-text cap
+  web_search_fetch_timeout_s: 5    # per-page HTTP timeout for enrichment fetches
   shell_timeout_seconds: 30
   allowed_paths:
     - ~/Documents

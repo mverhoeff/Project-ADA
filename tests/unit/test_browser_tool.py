@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from agent.tools import build_registry
@@ -17,6 +18,7 @@ from agent.tools.browser_tool import (
     WebFetchTool,
     WebSearchTool,
     _BrowserWorker,
+    extract_main_text,
     format_fetch_result,
     format_results,
 )
@@ -31,8 +33,20 @@ _BASE_CONFIG: dict[str, Any] = {
         "browser_max_results": 5,
         "browser_navigation_timeout_ms": 15000,
         "web_fetch_max_chars": 4000,
+        # 0 → no enrichment fetches, so the ddgs-only path is what these
+        # tests exercise. The enrichment path has its own tests below.
+        "web_search_fetch_count": 0,
     },
 }
+
+
+def _enriching_config(fetch_count: int = 2, excerpt_chars: int = 200) -> dict[str, Any]:
+    """A config that enables web-search enrichment fetches."""
+    agent = dict(_BASE_CONFIG["agent"])
+    agent["web_search_fetch_count"] = fetch_count
+    agent["web_search_excerpt_chars"] = excerpt_chars
+    agent["web_search_fetch_timeout_s"] = 5
+    return {"agent": agent}
 
 
 def _tool(config: dict[str, Any] | None = None) -> WebSearchTool:
@@ -186,6 +200,122 @@ def test_format_results_missing_fields() -> None:
     out = format_results([{"title": "Only title"}])
     assert "1. Only title" in out
     # No crash when snippet/url absent.
+
+
+def test_format_results_prefers_content_over_snippet() -> None:
+    out = format_results(
+        [
+            {
+                "title": "T",
+                "snippet": "short snippet",
+                "content": "the full extracted page content",
+                "url": "https://a.example",
+            }
+        ]
+    )
+    assert "the full extracted page content" in out
+    assert "short snippet" not in out
+
+
+# -- extract_main_text -------------------------------------------------------
+
+
+def test_extract_main_text_empty_returns_none() -> None:
+    assert extract_main_text("") is None
+
+
+def test_extract_main_text_extracts_article_body() -> None:
+    html = (
+        "<html><head><title>T</title></head><body><article>"
+        "<p>" + "A clear sentence of real article content. " * 12 + "</p>"
+        "</article></body></html>"
+    )
+    text = extract_main_text(html)
+    assert text is not None
+    assert "real article content" in text
+
+
+# -- WebSearchTool enrichment ------------------------------------------------
+
+
+def _html_echo(request: httpx.Request) -> httpx.Response:
+    """MockTransport handler: 200 with HTML that echoes the requested URL."""
+    return httpx.Response(200, text=f"<html><body>{request.url}</body></html>")
+
+
+def test_execute_enriches_results_with_fetched_content() -> None:
+    tool = WebSearchTool(
+        _enriching_config(fetch_count=2),
+        transport=httpx.MockTransport(_html_echo),
+    )
+    raw = [
+        {"title": "A", "href": "https://a.example", "body": "snippet a"},
+        {"title": "B", "href": "https://b.example", "body": "snippet b"},
+        {"title": "C", "href": "https://c.example", "body": "snippet c"},
+    ]
+    ctx, _ = _patch_ddgs(raw)
+    with patch(
+        "agent.tools.browser_tool.extract_main_text",
+        side_effect=lambda html: f"CONTENT::{html}",
+    ), ctx:
+        out = tool.execute({"query": "q"})
+
+    # Top 2 results show fetched content in place of the snippet.
+    assert "CONTENT::" in out
+    assert "snippet a" not in out
+    assert "snippet b" not in out
+    # The 3rd result is beyond fetch_count -> still shows its snippet.
+    assert "snippet c" in out
+
+
+def test_execute_falls_back_to_snippet_when_fetch_fails() -> None:
+    def failing(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    tool = WebSearchTool(
+        _enriching_config(fetch_count=2),
+        transport=httpx.MockTransport(failing),
+    )
+    raw = [
+        {"title": "A", "href": "https://a.example", "body": "snippet a"},
+        {"title": "B", "href": "https://b.example", "body": "snippet b"},
+    ]
+    ctx, _ = _patch_ddgs(raw)
+    with ctx:
+        out = tool.execute({"query": "q"})
+
+    # Non-200 -> no content extracted -> the snippet is retained.
+    assert "snippet a" in out
+    assert "snippet b" in out
+
+
+def test_execute_truncates_fetched_content_to_excerpt_chars() -> None:
+    tool = WebSearchTool(
+        _enriching_config(fetch_count=1, excerpt_chars=50),
+        transport=httpx.MockTransport(_html_echo),
+    )
+    raw = [{"title": "A", "href": "https://a.example", "body": "snippet a"}]
+    ctx, _ = _patch_ddgs(raw)
+    long_text = "word " * 100  # 500 chars
+    with patch(
+        "agent.tools.browser_tool.extract_main_text",
+        return_value=long_text,
+    ), ctx:
+        out = tool.execute({"query": "q"})
+
+    assert "…" in out  # truncation marker present
+    assert long_text not in out  # full text not included
+
+
+def test_execute_does_not_fetch_when_fetch_count_zero() -> None:
+    # _BASE_CONFIG sets web_search_fetch_count: 0 -> the ddgs snippet is used
+    # verbatim and no httpx client is constructed.
+    tool = _tool()
+    raw = [{"title": "A", "href": "https://a.example", "body": "snippet a"}]
+    ctx, _ = _patch_ddgs(raw)
+    with ctx:
+        out = tool.execute({"query": "q"})
+    assert "snippet a" in out
 
 
 def test_worker_start_error_is_sticky_and_raises_on_call() -> None:

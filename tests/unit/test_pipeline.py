@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any, ClassVar
 
 import pytest
@@ -95,23 +96,34 @@ class FakeTTS:
         yield b"audio:" + text.encode()
 
 
-class FakePlayer:
-    """AudioPlayer stand-in. Drains the chunk iterator and records calls.
+class _FakePlayerSession:
+    """Playback-session stand-in. Drains each sentence's chunk iterator.
 
     Yields to the event loop after each sentence so concurrent tasks
     (notably the barge-in listener) get a turn between TTS calls. The
-    real ``AudioPlayer`` has many await points inside ``play``; this
-    fake compresses them into a single tail await without affecting
-    test assertions.
+    real ``_PlayerSession.play`` has many await points; this fake
+    compresses them into a single tail await without affecting test
+    assertions.
     """
+
+    def __init__(self, sink: list[bytes]) -> None:
+        self._sink = sink
+
+    async def play(self, chunk_iter: AsyncIterator[bytes]) -> None:
+        async for chunk in chunk_iter:
+            self._sink.append(chunk)
+        await asyncio.sleep(0)
+
+
+class FakePlayer:
+    """AudioPlayer stand-in. Opens a session and records every played chunk."""
 
     def __init__(self) -> None:
         self.played: list[bytes] = []
 
-    async def play(self, chunk_iter: AsyncIterator[bytes]) -> None:
-        async for chunk in chunk_iter:
-            self.played.append(chunk)
-        await asyncio.sleep(0)
+    @asynccontextmanager
+    async def session(self) -> AsyncIterator[_FakePlayerSession]:
+        yield _FakePlayerSession(self.played)
 
 
 class FakeExecutor:
@@ -410,6 +422,44 @@ async def test_llm_error_mid_stream_speaks_user_message(fake_capture: None) -> N
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "I can't reach my language model right now."},
     ]
+
+
+@pytest.mark.asyncio
+async def test_tts_error_mid_stream_speaks_user_message(fake_capture: None) -> None:
+    """A ServiceUnavailableError from the TTS stream surfaces through the
+    synthesizer stage and is spoken back to the user."""
+    err = ServiceUnavailableError("TTS down", "I can't speak right now.")
+    stt = FakeSTT(text="hello")
+    llm = FakeLLM(responses=[["Hello there."]])
+
+    class FailingTTS(FakeTTS):
+        """Raises a TTS ServiceUnavailableError as soon as synthesis starts."""
+
+        async def synthesize(
+            self,
+            text: str,
+            voice: str | None = None,
+            speed: float | None = None,
+        ) -> AsyncIterator[bytes]:
+            self.spoken.append(text)
+            raise err
+            yield b""  # unreachable — present so this is an async generator
+
+    tts = FailingTTS()
+    player = FakePlayer()
+    executor = FakeExecutor(results=[])
+    deps = _build_deps(stt=stt, llm=llm, tts=tts, player=player, executor=executor)
+    session = Session()
+
+    result = await run_turn(session, deps, _config())
+
+    assert result is False
+    assert session.history == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "I can't speak right now."},
+    ]
+    # "Hello there." was attempted; the error message was spoken afterwards.
+    assert tts.spoken == ["Hello there.", "I can't speak right now."]
 
 
 @pytest.mark.asyncio

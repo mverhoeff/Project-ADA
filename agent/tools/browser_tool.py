@@ -3,22 +3,31 @@
 :class:`WebSearchTool` queries DuckDuckGo through the maintained ``ddgs``
 library, which handles DDG's evolving anti-bot countermeasures internally
 — scraping ``html.duckduckgo.com`` with a headless Chromium no longer
-works (DDG returns its JS homepage instead of results).
+works (DDG returns its JS homepage instead of results). It then fetches
+the top few result pages concurrently over plain HTTP and replaces the
+short DDG snippet with each page's extracted main text, so the model
+works with real content instead of meta-descriptions. Page fetching is
+best-effort — a page that times out or errors simply falls back to its
+snippet, so one slow page never fails the whole search.
 
 :class:`WebFetchTool` still drives a headless Chromium for arbitrary
-URLs, since loading a single user-chosen page is not gated by the same
-anti-bot protection. A single Chromium instance is launched lazily on a
-dedicated daemon thread (:class:`_BrowserWorker`) and reused across
-calls — Playwright's sync API objects are pinned to their creating
-thread, and the orchestrator dispatches tool calls through
-:func:`asyncio.to_thread`, which uses a non-deterministic worker pool.
+URLs, since a single user-chosen page may be JS-heavy in a way the
+search-result enrichment's plain-HTTP fetch cannot handle. A single
+Chromium instance is launched lazily on a dedicated daemon thread
+(:class:`_BrowserWorker`) and reused across calls — Playwright's sync
+API objects are pinned to their creating thread, and the orchestrator
+dispatches tool calls through :func:`asyncio.to_thread`, which uses a
+non-deterministic worker pool.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import queue
 import threading
 from typing import Any, ClassVar
+
+import httpx
 
 from agent.tools.base import BaseTool
 from core.exceptions import ToolExecutionError
@@ -29,20 +38,59 @@ _log = get_logger(__name__)
 
 _WORKER_START_TIMEOUT_S = 30.0
 
+# Sent on the search-result enrichment fetches so sites don't immediately
+# 403 a bare client; the headless-Chromium path sets its own UA.
+_FETCH_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def extract_main_text(html: str) -> str | None:
+    """Extract a page's main readable text from raw HTML via trafilatura.
+
+    Pure function — no I/O. Returns ``None`` when trafilatura is not
+    installed or finds nothing extractable, so callers can fall back to a
+    search snippet or a coarser extraction.
+
+    Args:
+        html: Raw HTML markup of a page.
+
+    Returns:
+        The extracted main text, stripped, or ``None`` if nothing usable
+        could be extracted.
+    """
+    try:
+        import trafilatura
+    except ImportError:
+        return None
+    text = trafilatura.extract(
+        html,
+        favor_recall=True,
+        include_comments=False,
+        include_tables=False,
+    )
+    if not text or not text.strip():
+        return None
+    return text.strip()
+
 
 def format_results(results: list[dict[str, str]]) -> str:
-    """Render a list of ``{title, snippet, url}`` dicts as plain text.
+    """Render a list of search-result dicts as plain text.
 
-    Pure function — extracted so it can be unit-tested without network I/O.
+    Each dict carries ``title``, ``url`` and a body — the extracted page
+    ``content`` when the result was fetched and enriched, otherwise the
+    search engine's ``snippet``. Pure function — extracted so it can be
+    unit-tested without network I/O.
     """
     if not results:
         return "No results found."
     lines: list[str] = []
     for i, r in enumerate(results, start=1):
         lines.append(f"{i}. {r.get('title', '').strip()}")
-        snippet = r.get("snippet", "").strip()
-        if snippet:
-            lines.append(f"   {snippet}")
+        body = (r.get("content") or r.get("snippet") or "").strip()
+        if body:
+            lines.append(f"   {body}")
         url = r.get("url", "").strip()
         if url:
             lines.append(f"   {url}")
@@ -192,19 +240,7 @@ class _BrowserWorker:
             html = page.content()
             title = (page.title() or "").strip()
 
-            text: str | None = None
-            try:
-                import trafilatura
-
-                text = trafilatura.extract(
-                    html,
-                    favor_recall=True,
-                    include_comments=False,
-                    include_tables=False,
-                )
-            except ImportError:
-                text = None
-
+            text = extract_main_text(html)
             if not text:
                 try:
                     text = page.locator("body").inner_text()
@@ -226,13 +262,29 @@ class _BrowserWorker:
 
 
 class WebSearchTool(BaseTool):
-    """Search the web via the ``ddgs`` library and return top results as text."""
+    """Search the web via ``ddgs`` and return the top results with content.
+
+    The result list comes from DuckDuckGo via ``ddgs``; the top
+    ``agent.web_search_fetch_count`` result pages are then fetched
+    concurrently over plain HTTP and their extracted main text replaces
+    the short DDG snippet. Enrichment is best-effort — a page that fails
+    to fetch keeps its snippet.
+
+    Args:
+        config: Full config dict; reads the ``agent`` subtree
+            (``browser_max_results``, ``web_search_fetch_count``,
+            ``web_search_excerpt_chars``, ``web_search_fetch_timeout_s``).
+        transport: Optional ``httpx`` transport for the enrichment
+            fetches, used by tests to inject mock responses without
+            hitting the network.
+    """
 
     name = "web_search"
     description = (
-        "Search the web and return the top results as text. "
-        "Use this whenever the user asks about current events, things on the "
-        "internet, or facts you are not certain about."
+        "Search the web and return the top results, each with the main "
+        "readable text extracted from the result page. Use this whenever "
+        "the user asks about current events, things on the internet, or "
+        "facts you are not certain about."
     )
     schema: ClassVar[dict[str, Any]] = {
         "type": "object",
@@ -249,9 +301,21 @@ class WebSearchTool(BaseTool):
         "required": ["query"],
     }
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
         agent_cfg = config.get("agent", {})
         self._default_max: int = int(agent_cfg.get("browser_max_results", 5))
+        self._fetch_count: int = int(agent_cfg.get("web_search_fetch_count", 3))
+        self._excerpt_chars: int = int(
+            agent_cfg.get("web_search_excerpt_chars", 1000)
+        )
+        self._fetch_timeout: float = float(
+            agent_cfg.get("web_search_fetch_timeout_s", 5)
+        )
+        self._transport = transport
 
     def execute(self, params: dict[str, Any]) -> str:
         query = params.get("query")
@@ -292,7 +356,61 @@ class WebSearchTool(BaseTool):
             }
             for r in raw
         ]
+        self._enrich(results)
         return format_results(results)
+
+    def _enrich(self, results: list[dict[str, str]]) -> None:
+        """Fetch the top results' pages concurrently and attach ``content``.
+
+        Mutates ``results`` in place: each successfully fetched entry
+        gains a ``content`` key with the page's extracted main text.
+        Best-effort — a fetch failure leaves the entry untouched so
+        :func:`format_results` falls back to its snippet.
+        """
+        if self._fetch_count <= 0:
+            return
+        targets = [
+            (i, r["url"])
+            for i, r in enumerate(results[: self._fetch_count])
+            if r.get("url")
+        ]
+        if not targets:
+            return
+        with httpx.Client(
+            transport=self._transport,
+            timeout=self._fetch_timeout,
+            follow_redirects=True,
+            headers={"User-Agent": _FETCH_USER_AGENT},
+        ) as client, concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(targets)
+        ) as pool:
+            futures = {
+                pool.submit(self._fetch_one, client, url): idx
+                for idx, url in targets
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                content = fut.result()  # _fetch_one swallows its own errors
+                if content:
+                    results[futures[fut]]["content"] = content
+
+    def _fetch_one(self, client: httpx.Client, url: str) -> str | None:
+        """Fetch and extract one page; return ``None`` on any failure."""
+        try:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                return None
+            text = extract_main_text(resp.text)
+        except Exception as exc:
+            _log.debug("web_search_fetch_failed", url=url, error=str(exc))
+            return None
+        if not text:
+            return None
+        if len(text) > self._excerpt_chars:
+            cut = text.rfind(" ", 0, self._excerpt_chars)
+            if cut <= 0:
+                cut = self._excerpt_chars
+            text = text[:cut].rstrip() + "…"
+        return text
 
 
 class WebFetchTool(BaseTool):

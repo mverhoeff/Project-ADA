@@ -7,13 +7,16 @@ exhaustive unit testing.
 
 Flush triggers:
     * ``.`` ``!`` ``?`` followed by whitespace (or via :meth:`flush`)
-    * a newline ``\\n``
     * the internal buffer exceeds ``max_chars`` (safety valve)
 
 Held back (no flush):
     * decimals / version numbers (``.`` followed by a digit)
     * common abbreviations (``Dr.``, ``e.g.``, ``U.S.A.``)
     * ellipses (``...``)
+    * bare newlines — retained in the buffer so markdown list items stay
+      in a single TTS chunk instead of fragmenting into one-word chunks.
+      A newline after a terminator (``.\\n``, ``!\\n``, ``?\\n``) still
+      flushes via the generic terminator-plus-whitespace rule.
 """
 
 from __future__ import annotations
@@ -103,14 +106,6 @@ class SentenceSplitter:
         return [trimmed] if trimmed else []
 
     def _step(self, ch: str, out: list[str]) -> None:
-        if ch == "\n":
-            sentence = self._buffer.strip()
-            self._buffer = ""
-            self._state = self._NORMAL
-            if sentence:
-                out.append(sentence)
-            return
-
         if self._state == self._NORMAL:
             if ch == ".":
                 self._state = self._AFTER_DOT

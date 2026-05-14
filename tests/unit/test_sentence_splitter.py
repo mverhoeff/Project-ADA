@@ -113,22 +113,40 @@ def test_ellipsis_followed_by_space_does_not_flush() -> None:
     assert _feed_all(s, "Hmm... okay then. ") == ["Hmm... okay then."]
 
 
-def test_newline_flushes_immediately() -> None:
+def test_bare_newline_does_not_fragment() -> None:
     s = SentenceSplitter()
     out = s.feed("foo\nbar")
-    assert out == ["foo"]
-    assert s.flush() == ["bar"]
+    assert out == []
+    assert s.flush() == ["foo\nbar"]
 
 
-def test_newline_flushes_mid_sentence_without_terminator() -> None:
+def test_newline_is_noop_in_normal_state() -> None:
     s = SentenceSplitter()
-    out = s.feed("an unfinished line\n")
-    assert out == ["an unfinished line"]
+    assert s.feed("word\nword") == []
+
+
+def test_newline_mid_sentence_without_terminator_holds() -> None:
+    s = SentenceSplitter()
+    assert s.feed("an unfinished line\n") == []
+    assert s.flush() == ["an unfinished line"]
+
+
+def test_list_items_not_fragmented() -> None:
+    """Markdown list items stay in one chunk so TTS does not pause per item."""
+    s = SentenceSplitter()
+    out = s.feed("- one\n- two\n- three")
+    assert out == []
+    assert s.flush() == ["- one\n- two\n- three"]
 
 
 def test_newline_after_terminator_emits_with_terminator() -> None:
     s = SentenceSplitter()
     assert s.feed("Hi.\n") == ["Hi."]
+
+
+def test_period_newline_still_splits() -> None:
+    s = SentenceSplitter()
+    assert _feed_all(s, "First.\nSecond.\n") == ["First.", "Second."]
 
 
 def test_consecutive_newlines_do_not_emit_empty() -> None:

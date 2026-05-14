@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import struct
 from collections.abc import AsyncIterator, Callable
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -94,14 +94,91 @@ class _OutputSink(Protocol):
 SinkFactory = Callable[[WavFormat], AbstractContextManager[_OutputSink]]
 
 
+class _PlayerSession:
+    """One turn's worth of playback through a single persistent sink.
+
+    Each :meth:`play` call drains one sentence's streaming-WAV chunk
+    iterator. The first call that yields a parseable header opens the
+    sink; every call (including the first) discards its own leading
+    44-byte WAV header. The PCM alignment buffer persists across calls so
+    a trailing odd byte from one sentence carries cleanly into the next.
+    """
+
+    def __init__(self, sink_factory: SinkFactory) -> None:
+        self._sink_factory = sink_factory
+        self._sink_cm: AbstractContextManager[_OutputSink] | None = None
+        self._sink: _OutputSink | None = None
+        self._pcm_buf = bytearray()
+
+    async def play(self, chunk_iter: AsyncIterator[bytes]) -> None:
+        """Drain one sentence's streaming-WAV chunk iterator into the sink.
+
+        The leading 44 bytes are buffered and skipped; on the first
+        sentence of the session they are parsed to open the sink. A PCM
+        accumulation buffer ensures every ``sink.write()`` receives a
+        whole number of samples (HTTP chunk boundaries may fall
+        mid-sample, including across the sentence boundary).
+
+        Raises:
+            ServiceUnavailableError: If the first sentence's WAV header is
+                malformed.
+        """
+        header_buf = bytearray()
+        header_skipped = False
+        try:
+            async for chunk in chunk_iter:
+                if not chunk:
+                    continue
+                if not header_skipped:
+                    header_buf.extend(chunk)
+                    if len(header_buf) < _HEADER_SIZE:
+                        continue
+                    if self._sink is None:
+                        try:
+                            wav_format = parse_wav_header(
+                                bytes(header_buf[:_HEADER_SIZE])
+                            )
+                        except ValueError as e:
+                            raise ServiceUnavailableError(
+                                f"TTS produced malformed WAV header: {e}",
+                                _USER_FACING_ERROR,
+                            ) from e
+                        self._sink_cm = self._sink_factory(wav_format)
+                        self._sink = self._sink_cm.__enter__()
+                    self._pcm_buf.extend(header_buf[_HEADER_SIZE:])
+                    header_skipped = True
+                else:
+                    self._pcm_buf.extend(chunk)
+                # Write only complete samples (2 bytes each for int16).
+                aligned = len(self._pcm_buf) & ~1
+                if aligned:
+                    self._sink.write(bytes(self._pcm_buf[:aligned]))
+                    del self._pcm_buf[:aligned]
+        except asyncio.CancelledError:
+            if self._sink is not None:
+                self._sink.abort()
+            raise
+
+    def close(self) -> None:
+        """Close the underlying sink. Idempotent; safe if no sink opened."""
+        if self._sink_cm is not None:
+            self._sink_cm.__exit__(None, None, None)
+            self._sink_cm = None
+            self._sink = None
+
+
 class AudioPlayer:
-    """Plays a streaming WAV chunk iterator to a sound sink.
+    """Opens turn-scoped playback sessions over a streaming WAV chunk source.
+
+    A :meth:`session` keeps one ``sounddevice`` output stream open for the
+    whole turn, so consecutive sentences play back-to-back without the
+    device restart gap of a per-sentence stream.
 
     Args:
         config: Loaded config dict; the ``audio.output_device`` key is
             forwarded to the default sink factory.
-        sink_factory: Optional context-manager factory invoked once with
-            the parsed :class:`WavFormat`. Defaults to a
+        sink_factory: Optional context-manager factory invoked once per
+            session with the parsed :class:`WavFormat`. Defaults to a
             ``sounddevice``-backed sink. Tests inject a fake here.
     """
 
@@ -115,53 +192,20 @@ class AudioPlayer:
             device=config.get("audio", {}).get("output_device"),
         )
 
-    async def play(self, chunk_iter: AsyncIterator[bytes]) -> None:
-        """Play every chunk from ``chunk_iter``.
+    @asynccontextmanager
+    async def session(self) -> AsyncIterator[_PlayerSession]:
+        """Yield a playback session that keeps one sink open for the turn.
 
-        The first 44 bytes are buffered, parsed as a WAV header, and used
-        to open the sink; remaining bytes are written through. A PCM
-        accumulation buffer ensures every sink.write() call receives a
-        whole number of samples (HTTP chunk boundaries may fall mid-sample).
-
-        Raises:
-            ServiceUnavailableError: If the WAV header is malformed.
+        The sink is opened lazily on the first
+        :meth:`_PlayerSession.play` call that produces a parseable
+        header, and closed when the context exits — including on
+        cancellation, after the in-flight ``play`` has aborted the sink.
         """
-        header_buf = bytearray()
-        pcm_buf = bytearray()
-        sink_cm: AbstractContextManager[_OutputSink] | None = None
-        sink: _OutputSink | None = None
+        sess = _PlayerSession(self._sink_factory)
         try:
-            async for chunk in chunk_iter:
-                if not chunk:
-                    continue
-                if sink is None:
-                    header_buf.extend(chunk)
-                    if len(header_buf) < _HEADER_SIZE:
-                        continue
-                    try:
-                        wav_format = parse_wav_header(bytes(header_buf[:_HEADER_SIZE]))
-                    except ValueError as e:
-                        raise ServiceUnavailableError(
-                            f"TTS produced malformed WAV header: {e}",
-                            _USER_FACING_ERROR,
-                        ) from e
-                    sink_cm = self._sink_factory(wav_format)
-                    sink = sink_cm.__enter__()
-                    pcm_buf.extend(header_buf[_HEADER_SIZE:])
-                else:
-                    pcm_buf.extend(chunk)
-                # Write only complete samples (2 bytes each for int16).
-                aligned = len(pcm_buf) & ~1
-                if aligned:
-                    sink.write(bytes(pcm_buf[:aligned]))
-                    del pcm_buf[:aligned]
-        except asyncio.CancelledError:
-            if sink is not None:
-                sink.abort()
-            raise
+            yield sess
         finally:
-            if sink_cm is not None:
-                sink_cm.__exit__(None, None, None)
+            sess.close()
 
 
 def _make_sounddevice_sink_factory(device: int | str | None) -> SinkFactory:

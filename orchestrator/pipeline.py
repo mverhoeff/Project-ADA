@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -180,7 +181,7 @@ async def _stream_with_tts(
     tools: list[dict[str, Any]] | None,
     config: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str, bool]:
-    """Run the Producer/Consumer pair for a single LLM stream.
+    """Run the three-stage streaming pipeline for a single LLM stream.
 
     Returns ``(tool_call_or_none, full_assistant_text, barge_in_occurred)``.
     The assistant text is the verbatim concatenation of every spoken
@@ -188,15 +189,32 @@ async def _stream_with_tts(
     calls travel through the structured event channel and never appear
     in the spoken text.
 
+    Three concurrent tasks form the pipeline:
+
+    * **producer** — reads the LLM event stream, feeds text through the
+      :class:`SentenceSplitter`, and enqueues complete sentences. A
+      :class:`ToolCallChunk` flips it into tool mode and ends the stream.
+    * **synthesizer** — pulls each sentence, starts its TTS request as a
+      pump task that streams audio into a per-sentence queue, and keeps
+      exactly one synthesis in flight (one sentence of lookahead) so the
+      next sentence's request overlaps the current sentence's playback.
+    * **player** — keeps a single audio sink open for the whole turn and
+      drains each sentence's audio queue into it back-to-back.
+
     When ``deps.barge_in`` is set, a background listener races against
-    the streaming pair. If the listener fires before streaming
-    completes, the producer and consumer are cancelled, ``AudioPlayer``
-    aborts the active sink, and the tuple's third element is ``True``.
+    the pipeline. If the listener fires first, all three stages are
+    cancelled, the player aborts the open sink, and the tuple's third
+    element is ``True``.
     """
     queue_size = int(
         config.get("orchestrator", {}).get("queue_size", _DEFAULT_QUEUE_SIZE)
     )
-    queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=queue_size)
+    sentence_queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=queue_size)
+    # maxsize=1 → one sentence of synthesis lookahead: the synthesizer may
+    # work on sentence N+1 while the player is still playing sentence N.
+    audio_queue: asyncio.Queue[asyncio.Queue[bytes | None] | None] = asyncio.Queue(
+        maxsize=1
+    )
     accumulated: list[str] = []
     detected_tool: dict[str, Any] | None = None
 
@@ -214,42 +232,68 @@ async def _stream_with_tts(
                 # TextChunk
                 accumulated.append(event.text)
                 for sentence in splitter.feed(event.text):
-                    await _safe_put(queue, sentence)
+                    await _safe_put(sentence_queue, sentence)
             for sentence in splitter.flush():
-                await _safe_put(queue, sentence)
+                await _safe_put(sentence_queue, sentence)
         finally:
-            await queue.put(None)
+            await sentence_queue.put(None)
 
-    async def consumer() -> None:
+    async def pump(text: str, out: asyncio.Queue[bytes | None]) -> None:
+        """Stream one sentence's TTS audio into ``out``, then sentinel it."""
+        try:
+            async for chunk in deps.tts.synthesize(text):
+                await out.put(chunk)
+        finally:
+            await out.put(None)
+
+    async def synthesizer() -> None:
         while True:
-            sentence = await queue.get()
+            sentence = await sentence_queue.get()
             if sentence is None:
+                await audio_queue.put(None)
                 return
-            await deps.player.play(deps.tts.synthesize(sentence))
+            chunk_q: asyncio.Queue[bytes | None] = asyncio.Queue()
+            pump_task = asyncio.create_task(pump(sentence, chunk_q))
+            try:
+                # Publish before awaiting the pump so the player can drain
+                # this sentence live while the pump is still producing it;
+                # awaiting the pump keeps exactly one synthesis in flight.
+                await audio_queue.put(chunk_q)
+                await pump_task
+            finally:
+                if not pump_task.done():
+                    pump_task.cancel()
+                    await asyncio.gather(pump_task, return_exceptions=True)
+
+    async def player() -> None:
+        async with deps.player.session() as playback:
+            while True:
+                chunk_q = await audio_queue.get()
+                if chunk_q is None:
+                    return
+                await playback.play(_drain(chunk_q))
 
     producer_task = asyncio.create_task(producer())
-    consumer_task = asyncio.create_task(consumer())
+    synth_task = asyncio.create_task(synthesizer())
+    player_task = asyncio.create_task(player())
+    stages = (producer_task, synth_task, player_task)
     barge_in_task: asyncio.Task[None] | None = None
     if deps.barge_in is not None:
         barge_in_task = asyncio.create_task(deps.barge_in.wait_for_speech())
 
     barge_in_occurred = False
     try:
-        barge_in_occurred = await _await_streaming(
-            producer_task, consumer_task, barge_in_task
-        )
+        barge_in_occurred = await _await_streaming(stages, barge_in_task)
         if barge_in_occurred:
-            for t in (producer_task, consumer_task):
+            for t in stages:
                 if not t.done():
                     t.cancel()
-            await asyncio.gather(
-                producer_task, consumer_task, return_exceptions=True
-            )
+            await asyncio.gather(*stages, return_exceptions=True)
         if barge_in_task is not None and not barge_in_task.done():
             barge_in_task.cancel()
             await asyncio.gather(barge_in_task, return_exceptions=True)
     except BaseException:
-        for t in (producer_task, consumer_task):
+        for t in stages:
             if not t.done():
                 t.cancel()
         if barge_in_task is not None and not barge_in_task.done():
@@ -257,32 +301,35 @@ async def _stream_with_tts(
         extras: list[asyncio.Task[None]] = (
             [barge_in_task] if barge_in_task is not None else []
         )
-        await asyncio.gather(
-            producer_task, consumer_task, *extras, return_exceptions=True
-        )
+        await asyncio.gather(*stages, *extras, return_exceptions=True)
         raise
 
     return detected_tool, "".join(accumulated), barge_in_occurred
 
 
+async def _drain(chunk_q: asyncio.Queue[bytes | None]) -> AsyncIterator[bytes]:
+    """Yield audio chunks from a per-sentence queue until its sentinel."""
+    while True:
+        chunk = await chunk_q.get()
+        if chunk is None:
+            return
+        yield chunk
+
+
 async def _await_streaming(
-    producer_task: asyncio.Task[None],
-    consumer_task: asyncio.Task[None],
+    stages: tuple[asyncio.Task[None], ...],
     barge_in_task: asyncio.Task[None] | None,
 ) -> bool:
-    """Await the producer + consumer, racing them against the listener.
+    """Await all pipeline stages, racing them against the barge-in listener.
 
-    Returns ``True`` iff the listener fired before streaming finished.
-    Re-raises any exception thrown by producer or consumer. Listener
-    failures are logged and otherwise ignored — they must never tear
-    down a turn that would otherwise complete normally.
+    Returns ``True`` iff the listener fired before the stages finished.
+    Re-raises the first exception thrown by any stage — checked before
+    each wait so a failed stage tears the turn down immediately even
+    while other stages are still pending. Listener failures are logged
+    and otherwise ignored — they must never tear down a turn that would
+    otherwise complete normally.
     """
-    while not (producer_task.done() and consumer_task.done()):
-        watch: set[asyncio.Future[Any]] = {producer_task, consumer_task}
-        if barge_in_task is not None and not barge_in_task.done():
-            watch.add(barge_in_task)
-        await asyncio.wait(watch, return_when=asyncio.FIRST_COMPLETED)
-
+    while True:
         if barge_in_task is not None and barge_in_task.done():
             if barge_in_task.cancelled():
                 pass
@@ -291,11 +338,17 @@ async def _await_streaming(
             else:
                 return True
 
-        for t in (producer_task, consumer_task):
+        for t in stages:
             if t.done() and not t.cancelled() and t.exception() is not None:
                 t.result()  # re-raises
 
-    return False
+        if all(t.done() for t in stages):
+            return False
+
+        watch: set[asyncio.Task[None]] = {t for t in stages if not t.done()}
+        if barge_in_task is not None and not barge_in_task.done():
+            watch.add(barge_in_task)
+        await asyncio.wait(watch, return_when=asyncio.FIRST_COMPLETED)
 
 
 async def _safe_put(queue: asyncio.Queue[str | None], sentence: str) -> None:
@@ -316,6 +369,7 @@ async def _speak_user_message(deps: PipelineDeps, message: str) -> None:
     if not message.strip():
         return
     try:
-        await deps.player.play(deps.tts.synthesize(message))
+        async with deps.player.session() as playback:
+            await playback.play(deps.tts.synthesize(message))
     except ServiceUnavailableError as e:
         _log.error("error_tts_failed", message=message, error=str(e))

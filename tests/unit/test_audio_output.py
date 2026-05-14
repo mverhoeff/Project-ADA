@@ -154,12 +154,19 @@ def test_parse_rejects_missing_data_marker() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AudioPlayer.play
+# AudioPlayer.session
 # ---------------------------------------------------------------------------
 
 
 def _config() -> dict[str, Any]:
     return {"audio": {"output_device": None}}
+
+
+async def _play_session(player: AudioPlayer, *sentences: list[bytes]) -> None:
+    """Open one session and play each sentence's chunk list through it."""
+    async with player.session() as sess:
+        for chunks in sentences:
+            await sess.play(async_iter(chunks))
 
 
 @pytest.mark.asyncio
@@ -168,7 +175,7 @@ async def test_play_writes_pcm_after_header_chunk() -> None:
     player = AudioPlayer(_config(), sink_factory=factory)
 
     pcm = b"\x00\x01" * 100
-    await player.play(async_iter([wav_streaming_header(24_000), pcm]))
+    await _play_session(player, [wav_streaming_header(24_000), pcm])
 
     assert factory.sink is not None
     assert b"".join(factory.sink.writes) == pcm
@@ -182,7 +189,7 @@ async def test_play_handles_header_split_across_chunks() -> None:
 
     header = wav_streaming_header(24_000)
     pcm = b"\xAB\xCD" * 50
-    await player.play(async_iter([header[:20], header[20:] + pcm]))
+    await _play_session(player, [header[:20], header[20:] + pcm])
 
     assert factory.sink is not None
     assert b"".join(factory.sink.writes) == pcm
@@ -195,7 +202,7 @@ async def test_play_handles_pcm_concatenated_with_header_in_first_chunk() -> Non
 
     header = wav_streaming_header(24_000)
     pcm = b"\x10\x20" * 25
-    await player.play(async_iter([header + pcm]))
+    await _play_session(player, [header + pcm])
 
     assert factory.sink is not None
     assert b"".join(factory.sink.writes) == pcm
@@ -206,25 +213,64 @@ async def test_play_passes_correct_wav_format_to_sink_factory() -> None:
     factory = FakeFactory()
     player = AudioPlayer(_config(), sink_factory=factory)
 
-    await player.play(async_iter([wav_streaming_header(24_000), b"\x00\x00"]))
+    await _play_session(player, [wav_streaming_header(24_000), b"\x00\x00"])
 
     assert factory.calls == [WavFormat(sample_rate=24_000, n_channels=1, bit_depth=16)]
 
 
 @pytest.mark.asyncio
-async def test_play_exits_sink_context_on_normal_completion() -> None:
+async def test_session_exits_sink_context_on_normal_completion() -> None:
     factory = FakeFactory()
     player = AudioPlayer(_config(), sink_factory=factory)
 
-    await player.play(async_iter([wav_streaming_header(24_000), b"\x00\x00"]))
+    async with player.session() as sess:
+        await sess.play(async_iter([wav_streaming_header(24_000), b"\x00\x00"]))
+        assert factory.sink is not None
+        assert factory.sink.exited is False  # still open inside the session
 
-    assert factory.sink is not None
     assert factory.sink.exited is True
     assert factory.sink.aborted is False
 
 
 @pytest.mark.asyncio
-async def test_play_aborts_sink_on_cancellation() -> None:
+async def test_session_reuses_sink_across_sentences() -> None:
+    factory = FakeFactory()
+    player = AudioPlayer(_config(), sink_factory=factory)
+
+    pcm1 = b"\x01\x02" * 10
+    pcm2 = b"\x03\x04" * 10
+    await _play_session(
+        player,
+        [wav_streaming_header(24_000), pcm1],
+        [wav_streaming_header(24_000), pcm2],
+    )
+
+    assert len(factory.calls) == 1  # sink opened exactly once for the turn
+    assert factory.sink is not None
+    # both 44-byte headers discarded; only PCM reaches the sink
+    assert b"".join(factory.sink.writes) == pcm1 + pcm2
+
+
+@pytest.mark.asyncio
+async def test_session_carries_pcm_alignment_across_sentences() -> None:
+    """A trailing odd byte from one sentence aligns against the next."""
+    factory = FakeFactory()
+    player = AudioPlayer(_config(), sink_factory=factory)
+
+    # sentence 1: header + 3 PCM bytes -> 1 byte held back for alignment
+    # sentence 2: header + 1 PCM byte -> joins the held byte into a sample
+    await _play_session(
+        player,
+        [wav_streaming_header(24_000), b"\xAA\xBB\xCC"],
+        [wav_streaming_header(24_000), b"\xDD"],
+    )
+
+    assert factory.sink is not None
+    assert b"".join(factory.sink.writes) == b"\xAA\xBB\xCC\xDD"
+
+
+@pytest.mark.asyncio
+async def test_session_aborts_sink_on_cancellation() -> None:
     factory = FakeFactory()
     player = AudioPlayer(_config(), sink_factory=factory)
 
@@ -238,7 +284,11 @@ async def test_play_aborts_sink_on_cancellation() -> None:
         await block.wait()  # never completes — wait until cancelled
         yield b"unreachable"
 
-    task = asyncio.create_task(player.play(slow_chunks()))
+    async def run() -> None:
+        async with player.session() as sess:
+            await sess.play(slow_chunks())
+
+    task = asyncio.create_task(run())
     await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -256,10 +306,21 @@ async def test_play_raises_service_unavailable_on_malformed_header() -> None:
 
     junk = b"junk" + b"\x00" * 40
     with pytest.raises(ServiceUnavailableError) as exc_info:
-        await player.play(async_iter([junk]))
+        await _play_session(player, [junk])
 
     assert "speak" in exc_info.value.user_message.lower()
     assert factory.sink is None  # sink never opened
+
+
+@pytest.mark.asyncio
+async def test_empty_session_opens_no_sink() -> None:
+    factory = FakeFactory()
+    player = AudioPlayer(_config(), sink_factory=factory)
+
+    async with player.session():
+        pass
+
+    assert factory.sink is None  # nothing played, no sink, close is a no-op
 
 
 @pytest.mark.asyncio
@@ -267,7 +328,7 @@ async def test_play_handles_empty_stream_gracefully() -> None:
     factory = FakeFactory()
     player = AudioPlayer(_config(), sink_factory=factory)
 
-    await player.play(async_iter([]))
+    await _play_session(player, [])
 
     assert factory.sink is None  # sink never opened, no exception raised
 
@@ -278,8 +339,8 @@ async def test_play_skips_empty_chunks() -> None:
     player = AudioPlayer(_config(), sink_factory=factory)
 
     pcm = b"\x11\x22" * 10
-    await player.play(
-        async_iter([b"", wav_streaming_header(24_000), b"", pcm, b""])
+    await _play_session(
+        player, [b"", wav_streaming_header(24_000), b"", pcm, b""]
     )
 
     assert factory.sink is not None
